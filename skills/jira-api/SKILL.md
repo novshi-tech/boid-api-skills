@@ -24,7 +24,9 @@ Jira Cloud API自体の素のベースURLは `https://<site>.atlassian.net` だ�
    $BOID_API_BASE/<service>/rest/api/3/<jira-api-path>
    ```
 
-   `<service>` はboidの `config.yaml` の `services:` ブロックで運用者が定義したサービス名。**Jiraは「1サービス名 = 1 Atlassianサイト + 1アカウント」の対応になるため、サイトを複数使い分けている環境ではサービス名が `jira-api` 固定ではない。** ワークスペースごとに `jira-api` / `jira-api-<識別子>` のように別名で登録されていることがあるので、実際に何という名前で有効化されているかは呼び出し元の `config.yaml`（`boid config get`）またはワークスペースの有効サービス一覧（`boid workspace services list <slug>`）で確認するか、不明ならユーザーに確認すること。
+   `<service>` はboidの `config.yaml` の `services:` ブロックで運用者が定義したサービス名。**Jiraは「1サービス名 = 1 Atlassianサイト + 1アカウント」の対応になるため、サイトを複数使い分けている環境ではサービス名が `jira-api` 固定ではない。** ワークスペースごとに `jira-api` / `jira-api-<識別子>` のように別名で登録されていることがある。
+
+   **サンドボックス内からは `/rest/api/3/myself` を候補名で総当たりすれば特定できる**（通る名前だけ200、それ以外は一律403）。手順は [references/pagination-and-errors.md](references/pagination-and-errors.md) の「サービス名を突き止める」を参照。ホスト側からなら `boid config get` / `boid workspace services list <slug>` で確認できる。それでも分からなければユーザーに確認すること。
 
    **`base_url` にはサイトのルート（`https://<site>.atlassian.net`）が登録される慣例で、`/rest/api/3` までは含まれない。** つまりパス側に `/rest/api/3/...` を自分で書く。この前提が崩れている（`base_url` に `/rest/api/3` まで含まれている）と全パスが二重になって404になるので、404が続くときはまずここを疑う。
 

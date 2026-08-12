@@ -134,13 +134,36 @@ for c in paged("/rest/api/3/issue/PROJ-123/comment"):
 |---|---|---|
 | 404 | `404 page not found` | リクエストパスが `/api/<job-token>/<service>/<tail>` の形に合っていない、または `.`/`..` を含むパストラバーサル的なパス |
 | 401 | `unauthorized: invalid or expired job token` | job token自体が不明・失効（ジョブ終了後は無効化される） |
-| 403 | `forbidden: service not permitted for this job token` | `<service>` を `config.yaml` の `services:` に定義しただけでは不十分。ワークスペース側でそのサービスを明示的に有効化していないと出る（`boid workspace services add <slug> <service>`） |
+| 403 | `forbidden: service not permitted for this job token` | **サービス名の誤り、またはワークスペースで未有効化。実測上いちばん多い。** ゲートウェイはワークスペースの許可リストを先に見るため、**存在しないサービス名を投げても同じ403になる**（下記「サービス名を突き止める」参照） |
 | 403 | `forbidden: read-only job token may only use GET/HEAD` | read-only jobからPOST/PUT/DELETEなど書き込み系メソッドを呼んだ。課題作成・コメント投稿・遷移・スプリント操作などはread-only jobからは実行できない |
-| 502 | `bad gateway: service X is not configured` | `<service>` という名前が `config.yaml` の `services:` に存在しない（**サービス名の誤り。Jiraはサイトごとに別名で登録されていることがあるので最初に疑う**） |
+| 502 | `bad gateway: service X is not configured` | ワークスペースでは有効化されているのに `config.yaml` の `services:` に定義が無い（運用者側の設定不整合）。**単なる名前の打ち間違いではこれは出ず、上の403になる** |
 | 502 | `bad gateway: api gateway credential resolution failed for service X: ...` | `secret_key` に対応するシークレットがそのワークスペースの名前空間に未設定、またはシークレット解決自体が失敗（fail-closed） |
 | 502 | `bad gateway: upstream request failed for service X` | 実際のJiraへの転送時にネットワーク的な失敗。メッセージからは実アップストリームのホスト名は分からないよう意図的に伏せられている |
 | 502 | `bad gateway: could not construct upstream path: ...` | 転送先URLの組み立てに失敗（パスの形が異常） |
 | 503 | `service unavailable: api gateway has no secret resolver configured` | boidデーモン自体にシークレットストアが配線されていない（運用者側の設定不足） |
+
+### サービス名を突き止める（サンドボックス内から）
+
+サンドボックスからは `config.yaml` もワークスペースの有効サービス一覧も直接は見えない。**しかし `/rest/api/3/myself` を候補名で総当たりすれば判別できる** — 通る名前だけが200を返し、それ以外は一律403になる。
+
+```bash
+for n in jira-api jira-api-ubs jira; do
+  printf "%-16s " "$n"
+  curl -s --cacert "$BOID_API_CA_FILE" -o /tmp/o -w "%{http_code} " \
+    "$BOID_API_BASE/$n/rest/api/3/myself"
+  head -c 80 /tmp/o; echo
+done
+```
+
+実測例:
+
+```
+jira-api         403 forbidden: service not permitted for this job token
+jira-api-ubs     200 {"self":"https://urban-b.atlassian.net/rest/api/3/user?accountId=..."}
+nope-api         403 forbidden: service not permitted for this job token
+```
+
+`/myself` は追加権限が要らず副作用もないので、この用途に最適。**200が返った名前が、そのジョブから使える唯一のJiraサービス名**であり、返ってきた `self` でどのサイトに繋がるかも同時に分かる。候補が全滅したらユーザーに確認する（勝手に直接 `atlassian.net` を叩きにいかない）。
 
 ### 401 の切り分けが特に重要
 
@@ -161,7 +184,7 @@ for c in paged("/rest/api/3/issue/PROJ-123/comment"):
 うまく行かないときはこの順で切り分けると速い。
 
 1. `GET /rest/api/3/myself` を叩く
-   - **プレーンテキストの403/502** → サービス名が違う、またはワークスペースで有効化されていない。`boid workspace services list <slug>` で確認
+   - **プレーンテキストの403** → サービス名が違う、またはワークスペースで有効化されていない。上記「サービス名を突き止める」の総当たりを試す（ホスト側からなら `boid workspace services list <slug>`）
    - **JiraのJSONで401** → 資格情報の失効。運用者にトークン再発行を依頼
    - **200** → 疎通・認証はOK。`emailAddress` と `self` で意図したアカウント・サイトかを確認
 2. 対象の課題/プロジェクトを最小のパスでGETしてみる（`/rest/api/3/issue/PROJ-123?fields=summary`）
