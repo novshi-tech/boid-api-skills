@@ -10,7 +10,8 @@ serviceProfiles:
       configurable: true
     credentials:
       - name: token
-        injection: bearer
+        injection: basic
+        usernameFrom: instance
 
 connectors:
   - name: assigned-issues
