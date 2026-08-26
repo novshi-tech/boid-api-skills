@@ -267,7 +267,18 @@ class BitbucketPRComments:
             self._my_uuid = self._fetch_my_uuid()
 
         after = _parse_time(cursor)
-        envelopes: "list[dict]" = []
+        # **Sort key is the parsed `datetime`, never the rendered string.**
+        # `_to_rfc3339` (via `datetime.isoformat()`) omits the fractional
+        # part entirely when microsecond == 0, so the rendered strings are
+        # NOT fixed-width — e.g. "...:00.500000Z" sorts lexicographically
+        # BEFORE "...:00Z" ('.' 0x2E < 'Z' 0x5A), even though 00.500000 is
+        # chronologically LATER than the bare 00 second boundary. This is
+        # the same class of bug boid's own internal/orchestrator/
+        # signal_store.go fixed a day before this port was written
+        # (comparing occurred_at as parsed time, not as string) — carry a
+        # correctly-typed sort key here too, dict envelopes have no
+        # datetime field for a later `sorted()` call to fall back on.
+        entries: "list[tuple[datetime, dict]]" = []
         for pull in self._list_my_open_prs():
             repo_slug = _repo_slug_of(pull)
             if repo_slug is None:
@@ -280,16 +291,18 @@ class BitbucketPRComments:
             if not jira_key:
                 # 合流先の Jira 課題が特定できない PR は候補にしない (khi からの継承)。
                 continue
-            envelopes.extend(self._comment_envelopes(repo_slug, pull, jira_key, after))
+            entries.extend(self._comment_envelopes(repo_slug, pull, jira_key, after))
         # 栞の契約は「古い順に前進」— 複数 PR をまたいで並べ直す。ingest 側も
         # oldest-first で呼ぶ必要がある (§5.3) ため、ここで確定させておく。
-        envelopes.sort(key=lambda e: e["occurred_at"])
-        return envelopes
+        entries.sort(key=lambda pair: pair[0])
+        return [envelope for _created_at, envelope in entries]
 
-    def _comment_envelopes(self, repo_slug: str, pull: dict, jira_key: str, after: "datetime | None") -> "list[dict]":
+    def _comment_envelopes(
+        self, repo_slug: str, pull: dict, jira_key: str, after: "datetime | None"
+    ) -> "list[tuple[datetime, dict]]":
         pr_id = pull.get("id")
         url = ((pull.get("links") or {}).get("html") or {}).get("href")
-        out: "list[dict]" = []
+        out: "list[tuple[datetime, dict]]" = []
         for c in self._list_comments(repo_slug, pr_id):
             created_at = _parse_time(c.get("created_on", ""))
             if created_at is None:
@@ -300,18 +313,29 @@ class BitbucketPRComments:
                 continue
             display_name = (c.get("user") or {}).get("display_name") or None
             author = SELF if display_name and display_name == self._my_display_name else display_name
-            out.append(_build_envelope(repo_slug, pr_id, c.get("id"), created_at, jira_key, url, author))
+            out.append((created_at, _build_envelope(repo_slug, pr_id, c.get("id"), created_at, jira_key, url, author)))
         return out
 
     # -- 一覧系 -----------------------------------------------------------
 
-    def _paged(self, path: str, params: "dict[str, str]") -> "list[dict]":
+    def _paged(self, path: str, params: "dict[str, str]", *, pinned_params: "dict[str, str] | None" = None) -> "list[dict]":
         """`next` が尽きるまで `values` を集める。安全上限に達したら**黙って打ち切る**
         (khi 実装と同じ理由 — 取りこぼしは次巡が拾う。cursor は実際に ingest した分までしか
         進まないので正しさは保たれる)。
+
+        `pinned_params`, if given, is force-merged into every page's request
+        params **after** parsing `next`'s own query string — Bitbucket's
+        `next` link is not verified (in production or in this port) to
+        always echo back every filter from the original request. If a page
+        2+ `next` URL ever omitted `state=OPEN`, silently falling back to
+        `current_params` as-parsed would resurrect the exact class of bug
+        this connector exists to avoid (module docstring: a `state` filter
+        quietly not applying inflates request volume to every PR state).
+        `_list_comments` has no filter that matters this way, so it passes
+        no `pinned_params`.
         """
         values: "list[dict]" = []
-        current_params: "dict[str, str] | None" = params
+        current_params: "dict[str, str] | None" = dict(params)
         for _ in range(MAX_PAGES):
             resp = self._get(self._service, path, current_params)
             values.extend(resp.get("values") or ())
@@ -319,15 +343,19 @@ class BitbucketPRComments:
             if not next_url:
                 break
             path, current_params = _split_next_url(next_url)
+            if pinned_params:
+                current_params.update(pinned_params)
         return values
 
     def _list_my_open_prs(self) -> "list[dict]":
         """workspace 横断で「自分が author の open PR」を 1 経路で取る。**`q=` は使わない**
-        — module docstring の 429 回避策そのもの。`state=OPEN` だけで絞れる。
+        — module docstring の 429 回避策そのもの。`state=OPEN` だけで絞れる。`pinned_params`
+        でページ 2 以降も `state=OPEN` を強制する (`_paged` の doc comment参照)。
         """
         return self._paged(
             f"/workspaces/{self._workspace}/pullrequests/{self._my_uuid}",
             {"state": "OPEN", "pagelen": "50"},
+            pinned_params={"state": "OPEN"},
         )
 
     def _list_comments(self, repo_slug: str, pr_id: Any) -> "list[dict]":

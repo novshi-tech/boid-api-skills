@@ -208,6 +208,16 @@ class PaginationTest(unittest.TestCase):
                 "/repositories/AoLani-ondemand/repo-b/pullrequests/2/comments",
             ],
         )
+        # M1 regression: this fixture's `next` link deliberately does NOT
+        # echo back `state=OPEN` (its query is only "pagelen=50&page=2") —
+        # mirrors an unverified assumption about Bitbucket's own `next`
+        # shape (khi only ever measured a single page of open PRs, so
+        # page 2+ behavior was never observed in production). Naively
+        # trusting `next`'s query string alone for page 2's params would
+        # silently drop the filter and re-fetch every PR state — the exact
+        # shape of bug this connector exists to avoid.
+        page2_call = next(c for c in calls if c[1] == "/workspaces/AoLani-ondemand/pullrequests/%7Bme%7D")
+        self.assertEqual(page2_call[2].get("state"), "OPEN")
 
     def test_the_comment_list_pages_through_next_too(self):
         """Regression guard for the specific bug the module docstring
@@ -326,8 +336,47 @@ class CursorTest(unittest.TestCase):
             service="bitbucket-api", workspace="AoLani-ondemand", get=fake_get, my_uuid="{me}", my_display_name="Me"
         )
         result = connector.fetch("")
-        self.assertEqual([e["occurred_at"] for e in result], sorted(e["occurred_at"] for e in result))
-        self.assertEqual(result[0]["id"], "bitbucket:repo-b:2:comment:1")
+        # Independently computed expected order (NOT `sorted(result)` —
+        # re-sorting the connector's own output and comparing it to itself
+        # is tautological and would pass even if fetch() sorted by the
+        # rendered string instead of the parsed datetime; see
+        # test_fractional_seconds_sort_before_whole_seconds_chronologically
+        # below for the fixture that actually distinguishes the two).
+        self.assertEqual(
+            [e["id"] for e in result],
+            ["bitbucket:repo-b:2:comment:1", "bitbucket:repo-a:1:comment:1"],
+        )
+
+    def test_fractional_seconds_sort_before_whole_seconds_chronologically(self):
+        """Regression guard: `_to_rfc3339` (via `datetime.isoformat()`)
+        omits the fractional part entirely when microsecond == 0, so the
+        rendered occurred_at strings are NOT fixed-width. A naive
+        `sorted(..., key=lambda e: e["occurred_at"])` on the STRINGS would
+        put "...:00.500000Z" BEFORE "...:00Z" ('.' 0x2E < 'Z' 0x5A) even
+        though 00.500000 (500ms into that second) is chronologically LATER
+        than the bare 00 second boundary. fetch() must sort by the parsed
+        `datetime`, not the rendered string, or this test fails.
+        """
+        result, _fake = fetch(
+            comments=[
+                comment(1, created="2026-08-22T00:00:00.500000+00:00"),  # 500ms into the second
+                comment(2, created="2026-08-22T00:00:00+00:00"),  # exactly on the second boundary
+            ]
+        )
+        # Premise check: the two rendered strings really do invert under
+        # plain lexicographic comparison — if this ever stops holding (a
+        # different envelope timestamp format), the ordering assertion
+        # below would no longer be exercising the bug this test exists to
+        # catch, so fail loudly rather than silently proving nothing.
+        by_id = {e["id"]: e["occurred_at"] for e in result}
+        rendered_500ms = by_id["bitbucket:repo-a:1:comment:1"]
+        rendered_0ms = by_id["bitbucket:repo-a:1:comment:2"]
+        self.assertLess(rendered_500ms, rendered_0ms, "fixture no longer exercises the string-vs-datetime sort bug")
+        # The actual assertion: chronological order, not string order.
+        self.assertEqual(
+            [e["id"] for e in result],
+            ["bitbucket:repo-a:1:comment:2", "bitbucket:repo-a:1:comment:1"],
+        )
 
 
 class SelfUuidDiscoveryTest(unittest.TestCase):
