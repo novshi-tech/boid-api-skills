@@ -20,7 +20,7 @@ adapted to the boid Integration Pack connector process contract
   - khi's SlackSignals.fetch(since) is a pure function returning Signal
     objects; here that becomes collect_new_mentions(), which stays
     injectable (a `get` callable, exactly like khi's own `get=gateway.get`
-    constructor parameter) so slack/tests/test_mentions.py can exercise the
+    constructor parameter) so slack/1.0.0/tests/test_mentions.py can exercise the
     filtering/identity/dedup logic with zero network access
 
 What did NOT change from khi's implementation (deliberate, not oversight —
@@ -238,13 +238,29 @@ def collect_new_mentions(
     `cursor_threshold` is a Unix timestamp (or None for "read from the
     beginning") — the exclusive lower bound. This function enforces
     `occurred_at > cursor` itself rather than trusting search.messages'
-    ordering alone (docs/plans/signal-ingest-detailed-design.md §5.3's
-    "栞の契約...外部検索の精度に任せず、取得後に occurred_at <= cursor を
-    自分で落とす") — the two queries below ask Slack for a recency-sorted
-    window and this function is what actually enforces the boundary.
+    ordering (docs/plans/signal-ingest-detailed-design.md §5.3's "栞の
+    契約...外部検索の精度に任せず、取得後に occurred_at <= cursor を自分で
+    落とす"): every match returned is checked against the threshold
+    independently — it does NOT stop early on the assumption that Slack's
+    `sort_dir=desc` ordering means "everything after the first old one is
+    older still" (an earlier version of this function did exactly that via
+    `break`, which is precisely the "外部検索の精度に任せる" this contract
+    line rules out — a single out-of-order hit from Slack would have let an
+    already-processed message slip back in undetected).
+
+    If a query's page comes back full (`len(matches) >= count`) without
+    this function ever seeing a match at or before the cursor, that page
+    may not cover the whole gap since the last successful run — this
+    connector does not paginate `search.messages`, so anything older than
+    the page is silently unreachable this cycle. That case is not treated
+    as a hard failure (a burst of mentions is not itself an error), but it
+    is not swallowed silently either: a warning goes to stderr so the
+    condition is visible in `boid job log` / failStreak diagnostics rather
+    than only showing up later as "a mention never made it into the
+    inbox".
     """
     seen: set[tuple[str, str]] = set()
-    rows: list[dict[str, str]] = []
+    scored: list[tuple[float, dict[str, str]]] = []
 
     for query in (f"<@{my_user_id}>", f"to:<@{my_user_id}>"):
         resp = _check_ok(
@@ -260,17 +276,14 @@ def collect_new_mentions(
             ),
         )
         matches = ((resp.get("messages") or {}).get("matches")) or ()
+        reached_cursor = False
         for m in matches:
             ts_value = _parse_ts(m.get("ts"))
             if ts_value is None:
                 continue
             if cursor_threshold is not None and ts_value <= cursor_threshold:
-                # Descending sort: everything after this in the SAME query's
-                # matches is older still, so it is safe to stop consuming
-                # this query's results here (khi precedent — see
-                # test_it_never_expands_the_thread and friends in
-                # slack/tests/test_mentions.py).
-                break
+                reached_cursor = True
+                continue
 
             channel_id = (m.get("channel") or {}).get("id", "")
             ts = str(m.get("ts", ""))
@@ -288,10 +301,32 @@ def collect_new_mentions(
             permalink = m.get("permalink")
             if permalink:
                 row["url"] = str(permalink)
-            rows.append(row)
+            # Sort key is the numeric ts, not the formatted occurred_at
+            # string — see this function's own note below on why a string
+            # sort is unsafe.
+            scored.append((ts_value, row))
 
-    rows.sort(key=lambda r: r["occurred_at"])
-    return rows
+        if cursor_threshold is not None and not reached_cursor and len(matches) >= count:
+            print(
+                f"mentions: search.messages query {query!r} returned a full "
+                f"page (count={count}) without reaching the cursor — this "
+                "connector does not paginate, so older new-since-cursor "
+                "mentions may not have been fetched this run; consider "
+                'raising the connector\'s "count" config',
+                file=sys.stderr,
+            )
+
+    # Sort by the numeric ts_value, NOT the formatted `occurred_at` string.
+    # _occurred_at() uses datetime.isoformat(), which OMITS the fractional
+    # second entirely when microsecond == 0 — so a whole-second timestamp
+    # ("...T00:00:00Z") sorts, as a STRING, before one a microsecond later
+    # ("...T00:00:00.000001Z"), because '.' (0x2E) < 'Z' (0x5A) even though
+    # the first instant is chronologically EARLIER. This is the exact same
+    # trap boid's own internal/orchestrator/signal_store.go documents for
+    # its stored cursor format (signalTimeLayout's doc comment) — sorting
+    # the pre-formatting numeric value sidesteps it entirely.
+    scored.sort(key=lambda item: item[0])
+    return [row for _, row in scored]
 
 
 # ---------------------------------------------------------------------------

@@ -31,11 +31,12 @@ connectors:
         # Max hits requested per search.messages query (one call for
         # "<@my_user_id>", one for "to:<@my_user_id>"). Optional — defaults
         # to 20 inside the connector when omitted, matching the migrated
-        # khi-task-collector adapter's own default. search.messages sorts
-        # descending by timestamp and the connector stops consuming a page
-        # once it crosses the cursor, so raising this only matters for a
-        # workspace with an unusually bursty mention volume within one
-        # trigger interval.
+        # khi-task-collector adapter's own default. The connector does not
+        # paginate beyond this single page, so raise it for a workspace
+        # with an unusually bursty mention volume within one trigger
+        # interval — connectors/mentions warns on stderr when a page comes
+        # back full without reaching the cursor, which is the signal that
+        # count should go up.
         count:
           type: number
 

@@ -1,4 +1,5 @@
-"""Unit tests for slack/connectors/mentions — no network, no boid daemon.
+"""Unit tests for slack/1.0.0/connectors/mentions — no network, no boid
+daemon.
 
 The connector is a single executable file with no .py extension (matches
 the design doc's layout example, `connectors/assigned-issues`), so it is
@@ -8,12 +9,14 @@ auth.test) or a subprocess (`boid signal cursor`/`ingest`) is exercised
 through the connector's own injection points (`get`, `run`) — this suite
 never calls urllib or subprocess for real.
 
-Run with: python3 -m unittest discover -s slack/tests -v
+Run with: python3 -m unittest discover -s slack/1.0.0/tests -v
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -129,6 +132,27 @@ class CursorFilteringTest(unittest.TestCase):
         rows = mentions.collect_new_mentions(fake, my_user_id="U123", cursor_threshold=None)
         self.assertEqual(len(rows), 2)
 
+    def test_an_out_of_order_hit_does_not_short_circuit_later_ones(self):
+        """search.messages' `sort_dir=desc` ordering is not something this
+        connector trusts for correctness (§5.3: "外部検索の精度に任せず、
+        取得後に occurred_at <= cursor を自分で落とす") — an old hit
+        appearing BEFORE a newer one in the response must not stop the
+        scan. An earlier version of collect_new_mentions used `break` on
+        the first at/before-cursor hit, which would have discarded the
+        second (genuinely new) match below."""
+        fake = FakeGet(
+            routes(
+                **{
+                    "/search.messages": matches(
+                        match("1755680000.000100"),  # at/before the cursor
+                        match("1755680000.000300"),  # strictly after — out of order
+                    )
+                }
+            )
+        )
+        rows = mentions.collect_new_mentions(fake, my_user_id="U123", cursor_threshold=1755680000.0002)
+        self.assertEqual([r["id"] for r in rows], ["slack:C1:1755680000.000300"])
+
 
 # ---------------------------------------------------------------------------
 # collect_new_mentions: dedup, ordering, id/identity shape
@@ -204,12 +228,109 @@ class ShapeTest(unittest.TestCase):
             )
         )
         rows = mentions.collect_new_mentions(fake, my_user_id="U123", cursor_threshold=None)
-        self.assertEqual([r["occurred_at"] for r in rows], sorted(r["occurred_at"] for r in rows))
+        self.assertEqual(
+            [r["id"] for r in rows],
+            [
+                "slack:C1:1755600000.000100",
+                "slack:C1:1755650000.000200",
+                "slack:C1:1755680000.000300",
+            ],
+        )
+
+    def test_sort_uses_the_numeric_timestamp_not_the_formatted_string(self):
+        """A whole-second timestamp's `occurred_at` STRING omits the
+        fractional component entirely (datetime.isoformat() only includes
+        microseconds when they are non-zero), so comparing `occurred_at`
+        values as strings puts a microsecond-later timestamp BEFORE a
+        whole-second one — '.' (0x2E) sorts before 'Z' (0x5A) — even
+        though it is chronologically LATER. This is the exact trap boid's
+        own internal/orchestrator/signal_store.go documents for its
+        stored cursor format. Assert against an explicit,
+        independently-known order — not `sorted(rows) == rows` compared
+        to itself, which would pass even if the sort key were wrong."""
+        fake = FakeGet(
+            routes(
+                **{
+                    "/search.messages": matches(
+                        match("1755680000.000001"),  # 1us after the whole second
+                        match("1755680000.000000"),  # the whole second itself — earlier
+                    )
+                }
+            )
+        )
+        rows = mentions.collect_new_mentions(fake, my_user_id="U123", cursor_threshold=None)
+        self.assertEqual(
+            [r["id"] for r in rows],
+            ["slack:C1:1755680000.000000", "slack:C1:1755680000.000001"],
+        )
+        # Confirms the premise: the whole-second row's occurred_at has NO
+        # fractional component, while the microsecond-later row's does — a
+        # naive string sort would place the "." string before the "Z"
+        # string, i.e. exactly backwards from the assertion above.
+        self.assertNotIn(".", rows[0]["occurred_at"])
+        self.assertIn(".", rows[1]["occurred_at"])
 
     def test_occurred_at_is_rfc3339_utc(self):
         fake = FakeGet(routes(**{"/search.messages": matches(match("1755680000.000200"))}))
         (row,) = mentions.collect_new_mentions(fake, my_user_id="U123", cursor_threshold=None)
         self.assertTrue(row["occurred_at"].endswith("Z"))
+
+
+# ---------------------------------------------------------------------------
+# F1: a full, unpaginated page that never reaches the cursor is a silent
+# data-loss risk (this connector does not implement search.messages
+# pagination) — not a hard failure, but must not pass silently either.
+# ---------------------------------------------------------------------------
+
+
+class FullPageWarningTest(unittest.TestCase):
+    def test_warns_when_a_full_page_never_reaches_the_cursor(self):
+        fake = FakeGet(
+            routes(**{"/search.messages": matches(match("1755680000.000300"))})
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            mentions.collect_new_mentions(
+                fake, my_user_id="U123", cursor_threshold=1755680000.0002, count=1
+            )
+        self.assertIn("without reaching the cursor", stderr.getvalue())
+
+    def test_no_warning_when_the_cursor_is_reached_within_the_page(self):
+        fake = FakeGet(
+            routes(**{"/search.messages": matches(match("1755680000.000100"))})
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            mentions.collect_new_mentions(
+                fake, my_user_id="U123", cursor_threshold=1755680000.0002, count=1
+            )
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_no_warning_when_the_page_is_not_full(self):
+        """Only one match came back but count allowed up to 5 — nothing to
+        suggest more history exists beyond this page."""
+        fake = FakeGet(
+            routes(**{"/search.messages": matches(match("1755680000.000300"))})
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            mentions.collect_new_mentions(
+                fake, my_user_id="U123", cursor_threshold=1755680000.0002, count=5
+            )
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_no_warning_on_a_full_first_run_with_no_cursor(self):
+        """cursor_threshold=None means "never ingested before" — there is
+        no cursor to fail to reach, so this case is not flagged even if
+        the page is full (a large initial backfill is expected, not an
+        error)."""
+        fake = FakeGet(
+            routes(**{"/search.messages": matches(match("1755680000.000300"))})
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            mentions.collect_new_mentions(fake, my_user_id="U123", cursor_threshold=None, count=1)
+        self.assertEqual(stderr.getvalue(), "")
 
 
 # ---------------------------------------------------------------------------
