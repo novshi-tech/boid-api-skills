@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""jira-cloud Integration Pack — ``assigned-issues`` connector.
+
+Detects newly-updated issues assigned to the gateway's injected account and
+hands them to boid as Signals (envelope v0). This is a port of the
+khi-task-collector ``khi/adapters/jira.py`` search logic — the changes are
+the two boundaries the Pack contract dictates (design doc
+``signal-ingest-detailed-design.md`` §10, PR-8 row):
+
+- bookmark read/write: ``FileBookmarks`` → ``boid signal cursor``
+- output: building a ``Signal`` object → JSONL piped to ``boid signal ingest``
+
+Everything else — searching only ``assignee = currentUser()``, requesting
+only the ``updated`` field (never ``description``/comments, since a
+comment landing on an issue moves its ``updated`` too, so a single search
+is enough to detect "is there something new"), paging via
+``nextPageToken``, and never fetching ``author`` (Jira's issue-update
+response never says who touched it) — carries over unchanged from the
+migration source.
+
+Pack contract (``signal-ingest-detailed-design.md`` §5.3/§7.2), the parts
+this file is responsible for satisfying:
+
+- input: ``BOID_SIGNAL_SERVICE`` / ``BOID_SIGNAL_CONNECTOR`` /
+  ``BOID_SIGNAL_CONFIG`` (JSON) + the existing ``BOID_API_BASE`` /
+  ``BOID_API_CA_FILE``. No CLI arguments.
+- bookmark: read via ``boid signal cursor`` (never a local file) — and the
+  cursor contract is enforced HERE, not trusted to the JQL time bound: this
+  connector always drops any issue whose ``updated`` is at-or-before the
+  cursor after fetching it, regardless of how the search itself was
+  bounded (see ``_since_clause``'s docstring for why the search bound
+  alone cannot be trusted).
+- external fetch: ``$BOID_API_BASE/$BOID_SIGNAL_SERVICE/...`` only, via the
+  standard library (``urllib``/``ssl``/``json`` — no third-party HTTP
+  client), mirroring khi's ``adapters/gateway.py``.
+- output: JSONL to ``boid signal ingest``'s stdin, oldest-first, chunked
+  across multiple calls if large.
+- exit: 0 on success, non-zero on any failure — nothing is swallowed.
+
+``configSchema`` (see ``integration.yaml``): ``jql`` (override the default
+``assignee = currentUser()`` base filter — must not include its own
+``ORDER BY``, see ``_build_jql``), ``max_results`` (search page size), and
+``initial_window_days`` (how far back the very first, cursor-less run
+searches — see ``_since_clause`` for why this must never be unbounded).
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from typing import Any, Mapping, Sequence
+
+#: Gateway call timeout. This connector's derived trigger runs on a fixed
+#: schedule (``signals.sources[].every`` in the metaproject's
+#: project.yaml) — a single stuck call must not hang past that.
+DEFAULT_TIMEOUT_SECONDS = 30
+
+#: Safety cap on search/jql pagination. Reaching this without exhausting
+#: ``nextPageToken`` raises rather than truncating silently — a silently
+#: dropped page shows up only as "signals that never arrive", which is
+#: undetectable from the outside (ported from khi/adapters/jira.py's
+#: ``_MAX_SEARCH_PAGES`` / ``JiraPaginationExhaustedError``).
+MAX_SEARCH_PAGES = 20
+
+DEFAULT_MAX_RESULTS = 100
+
+#: How far back the very first run (empty cursor) searches. Without this,
+#: an unbounded first search either pulls a workspace's entire assigned-
+#: issue history in one run or — past MAX_SEARCH_PAGES worth of issues —
+#: raises PaginationExhaustedError on every single run forever, since a
+#: raise here means the run never reaches ingest, so the cursor (which
+#: only ever advances inside IngestSignals) never moves and the next run
+#: repeats the exact same unbounded search. boid has no CLI to seed a
+#: cursor out-of-band as of this Pack's v0, so this bound is this
+#: connector's only way out of that trap.
+DEFAULT_INITIAL_WINDOW_DAYS = 30
+
+#: How many envelope rows go into a single ``boid signal ingest`` call.
+#: Each call is its own transaction (§5.3) — chunking bounds both memory
+#: and how much progress a mid-run crash could lose, without changing the
+#: net result (IngestSignals dedups and only ever advances the cursor
+#: forward).
+INGEST_CHUNK_SIZE = 200
+
+DEFAULT_JQL = "assignee = currentUser()"
+
+
+class GatewayError(Exception):
+    """A boid API gateway call finished with a non-2xx status.
+
+    Mirrors khi's ``adapters/gateway.py.GatewayError``: carries the raw
+    status/body rather than reclassifying gateway failures (403/502/...)
+    vs. upstream Jira failures (a 200 status Jira error would show up
+    elsewhere) — the caller (here: ``main``'s top-level handler) just
+    surfaces the message and exits non-zero.
+    """
+
+    def __init__(self, service: str, path: str, status: int, body: str) -> None:
+        self.service = service
+        self.path = path
+        self.status = status
+        self.body = body
+        snippet = body if len(body) <= 500 else body[:500] + "…"
+        super().__init__(f"boid API gateway: {service}{path} -> HTTP {status}: {snippet}")
+
+
+class PaginationExhaustedError(Exception):
+    """search/jql pagination hit MAX_SEARCH_PAGES before finishing."""
+
+
+def _base_url() -> str:
+    base = os.environ.get("BOID_API_BASE")
+    if not base:
+        raise GatewayError("", "", 0, "BOID_API_BASE is not set")
+    return base.rstrip("/")
+
+
+def _ssl_context() -> "ssl.SSLContext | None":
+    cafile = os.environ.get("BOID_API_CA_FILE")
+    if not cafile:
+        return None
+    return ssl.create_default_context(cafile=cafile)
+
+
+def gateway_get(
+    service: str,
+    path: str,
+    params: "Mapping[str, str] | None" = None,
+    *,
+    urlopen: Any = urllib.request.urlopen,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Any:
+    """GET one path through the boid API gateway.
+
+    No ``Authorization`` header is ever built here — the gateway injects
+    the real Jira credential server-side and strips anything the client
+    sent (jira-api reference skill's authentication.md); this connector
+    process never holds a Jira token. ``urlopen`` is an injection point for
+    tests, matching khi's ``adapters/gateway.py`` test approach (stub
+    ``urlopen``, never touch the network).
+    """
+    url = f"{_base_url()}/{service}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urlopen(req, context=_ssl_context(), timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise GatewayError(service, path, e.code, body) from e
+    except urllib.error.URLError as e:
+        raise GatewayError(service, path, 0, str(e.reason)) from e
+    if not raw:
+        return {}
+    text = raw.decode("utf-8")
+    if not text.strip():
+        return {}
+    return json.loads(text)
+
+
+def _parse_jira_time(value: str) -> "datetime | None":
+    """Parse a Jira timestamp (e.g. ``2026-08-22T09:00:00.000+0900``) into
+    a tz-aware ``datetime``.
+
+    Returns ``None`` for anything unparsable (including empty) — one
+    unreadable issue must not abort the whole run (ported from
+    khi/adapters/jira.py's ``_parse_jira_time``). A value with no offset is
+    read as UTC rather than rejected, for the same reason.
+    """
+    if not value:
+        return None
+    text = value.strip()
+    if len(text) >= 5 and text[-5] in "+-" and text[-4:].isdigit():
+        text = text[:-2] + ":" + text[-2:]
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def parse_cursor(value: str) -> "datetime | None":
+    """Parse the RFC3339 string ``boid signal cursor`` returns.
+
+    An empty string means "no cursor yet" (first run) — same meaning
+    ``_parse_jira_time`` gives an empty/unparsable value.
+    """
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _to_rfc3339(dt: datetime) -> str:
+    """Render ``dt`` as an RFC3339 string boid's ingest side accepts
+    (colon-separated offset; boid's own ``parseSignalTime`` is
+    ``time.Parse(time.RFC3339, ...)``), normalized to UTC.
+    """
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _since_clause(
+    cursor_at: "datetime | None",
+    now: datetime,
+    *,
+    initial_window_days: float = DEFAULT_INITIAL_WINDOW_DAYS,
+) -> str:
+    """Build a JQL ``updated >= "-<N>m"`` / ``"-<N>d"`` clause bounding
+    search to no earlier than the cursor — always returns a bound, never
+    an unbounded search (see ``initial_window_days`` below).
+
+    **Deliberately a relative duration, not an absolute date literal.**
+    Jira's bare/quoted date JQL literals are interpreted in the searching
+    account's Jira *site* timezone — the khi migration source hardcoded
+    JST to compensate (``khi/adapters/jira.py``'s ``JST`` constant, with a
+    comment on the 13-hour re-detection loop this caused when it was
+    unaccounted for) because khi only ever pointed at one, known-JST site.
+    A Pack has no such guarantee — a service instance can be any Jira site
+    in any timezone — so a hardcoded offset would silently misfilter on
+    every site not in that one timezone. A relative duration (``-N<unit>``)
+    is evaluated as "N <unit> of wall-clock time before now", which
+    sidesteps site-timezone interpretation entirely rather than
+    compensating for it.
+
+    **No cursor yet (first run): bounded by `initial_window_days`, not
+    left unbounded.** An unbounded first search either pulls a workspace's
+    entire assigned-issue history in one run, or — once it exceeds
+    MAX_SEARCH_PAGES worth of issues — raises PaginationExhaustedError
+    before ever reaching ingest. Since the cursor only ever advances
+    inside a successful ``IngestSignals`` call, a run that raises before
+    ingest leaves the cursor exactly where it was, so the NEXT run repeats
+    the identical unbounded search and raises again — forever, with
+    nothing ever ingested. Bounding the first search caps how much history
+    a single run can pull, so it can actually finish and ingest something,
+    advancing the cursor for the next run to build on.
+
+    **Cursor present: the window is rounded up one extra minute beyond the
+    exact elapsed time** (``ceil(elapsed/60) + 1``) — a window narrower
+    than the true cursor age is exactly the "取りこぼす" failure this
+    connector must not have (§5.3): if it undershoots, an issue updated in
+    the same instant this connector reads "now" could be excluded from the
+    search itself, before the post-fetch filter below ever gets a chance
+    to see it. The extra minute of margin absorbs request latency and
+    clock skew between this process and the boid daemon that stamped the
+    cursor — without it, an elapsed time that rounds up to *exactly* the
+    true age (rather than past it) leaves zero slack. Overshooting only
+    means re-fetching already-processed issues, which the post-fetch
+    filter (and, one layer further out, inbox dedup) discards for free.
+    """
+    if cursor_at is None:
+        days = max(1, math.ceil(initial_window_days))
+        return f'updated >= "-{days}d"'
+    elapsed_seconds = (now - cursor_at).total_seconds()
+    minutes = max(1, math.ceil(elapsed_seconds / 60) + 1)
+    return f'updated >= "-{minutes}m"'
+
+
+def _build_jql(
+    base_jql: str,
+    cursor_at: "datetime | None",
+    now: datetime,
+    *,
+    initial_window_days: float = DEFAULT_INITIAL_WINDOW_DAYS,
+) -> str:
+    """Combine the caller's base JQL with the cursor bound and this
+    connector's own ordering.
+
+    Rejects (rather than silently stripping) a ``base_jql`` that already
+    contains its own ``ORDER BY`` — this connector always appends
+    ``ORDER BY updated ASC`` itself (required for the oldest-first ingest
+    guarantee, §5.3), and Jira rejects a JQL containing two ``ORDER BY``
+    clauses outright, so an operator-supplied ``config.jql`` with its own
+    ordering would otherwise fail on every single run with no clear reason
+    why.
+    """
+    if "order by" in base_jql.lower():
+        raise ValueError(
+            f"connectors/assigned-issues: config.jql must not include its own ORDER BY "
+            f"(got {base_jql!r}) — this connector always appends `ORDER BY updated ASC` "
+            "itself to guarantee oldest-first ingest order"
+        )
+    since = _since_clause(cursor_at, now, initial_window_days=initial_window_days)
+    return f"{base_jql} AND {since} ORDER BY updated ASC"
+
+
+def _search(
+    service: str,
+    jql: str,
+    *,
+    get: Any = gateway_get,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> list[dict]:
+    """Page through ``/rest/api/3/search/jql`` until ``nextPageToken``
+    stops appearing (the final page omits the field rather than returning
+    it empty — jira-api skill's references/search-and-jql.md, confirmed
+    against production).
+
+    Only ever requests the ``updated`` field — never ``summary`` or
+    ``description`` — the same scope-reduction the migration source made
+    (khi/adapters/jira.py's module docstring): this connector's job is
+    detecting that *something* changed, not carrying what changed. A
+    judgment task reads the issue itself, live, via the jira-api skill, if
+    it needs more than that.
+    """
+    issues: list[dict] = []
+    next_page_token: "str | None" = None
+    for _ in range(MAX_SEARCH_PAGES):
+        params = {"jql": jql, "maxResults": str(max_results), "fields": "updated"}
+        if next_page_token:
+            params["nextPageToken"] = next_page_token
+        resp = get(service, "/rest/api/3/search/jql", params)
+        issues.extend(resp.get("issues") or ())
+        next_page_token = resp.get("nextPageToken") or None
+        if not next_page_token:
+            return issues
+    raise PaginationExhaustedError(
+        f"jira search/jql pagination did not finish within the safety cap "
+        f"({MAX_SEARCH_PAGES} pages) — refusing to truncate silently, since a "
+        "dropped page would show up only as signals that never arrive"
+    )
+
+
+def _site_identity(service: str, *, get: Any = gateway_get) -> str:
+    """One ``/myself`` call, used only to recover the real site origin
+    (for building browse URLs) from the response body's own ``self`` URL.
+
+    The gateway hides the upstream hostname from its OWN error bodies and
+    routing (jira-api skill's authentication.md: "実際のアップストリーム
+    のホスト名... はエラー時も含めてサンドボックス側には一切見えない") —
+    but that's about gateway-generated errors specifically. A *successful*
+    proxied response is passed through verbatim, ``self`` field included
+    (see the same skill's worked example), so this is the one place this
+    connector can learn its site's real browse-URL host without being
+    handed it out-of-band via connector config.
+    """
+    resp = get(service, "/rest/api/3/myself")
+    self_url = str(resp.get("self") or "")
+    parsed = urllib.parse.urlparse(self_url)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
+def collect_envelopes(
+    *,
+    service: str,
+    base_jql: str,
+    cursor_at: "datetime | None",
+    now: datetime,
+    max_results: int = DEFAULT_MAX_RESULTS,
+    initial_window_days: float = DEFAULT_INITIAL_WINDOW_DAYS,
+    get: Any = gateway_get,
+) -> list[dict]:
+    """Fetch, post-filter, and shape one connector run's Signal rows —
+    envelope v0 (``signal-driven-review.md`` §5.2). Every row carries only
+    ``id`` / ``occurred_at`` / ``identity`` / ``url`` — ``author`` is
+    omitted (Jira's issue-update response never says who touched it, so
+    there is nothing honest to put there; the migration source leaves this
+    ``None`` for the same reason) and ``title`` is omitted (the search
+    above never requests ``summary``, by design — see ``_search``).
+
+    ``id`` is built from the SAME normalized value as ``occurred_at``
+    (``_to_rfc3339(at)``), not Jira's raw ``updated`` string — the raw
+    string's rendering depends on the gateway account's Jira profile
+    timezone setting, so if that setting ever changed, the very same event
+    would produce a different ``id`` and dedup (keyed on ``id``) would
+    silently stop recognizing it as already-seen, re-ingesting a
+    workspace's whole backlog. The normalized UTC form is stable
+    regardless of any account-side timezone setting.
+
+    Returned oldest-first (§5.3: "ページングする connector は古い順
+    (oldest-first) に ingest すること") regardless of the order pages
+    arrived in — the search JQL already asks for ``ORDER BY updated ASC``,
+    but this re-sorts explicitly rather than trusting that ordering to
+    survive multiple pages untouched.
+
+    Rows dropped along the way (no ``key``, an unparsable ``updated``, or
+    at-or-before the cursor) are counted and, if any were dropped, reported
+    in one line on stderr — not to fail the run (a handful of drops is
+    routine), but so a *systemic* cause (e.g. Jira's timestamp format
+    changing, silently zeroing every row via the unparsable-timestamp
+    branch) is visible somewhere instead of manifesting only as "this
+    connector exits 0 but nothing ever arrives", which trips no failure
+    detection at all.
+    """
+    site_base_url = _site_identity(service, get=get)
+    jql = _build_jql(base_jql, cursor_at, now, initial_window_days=initial_window_days)
+    rows: list[dict] = []
+    skipped_no_key = 0
+    skipped_unparsable = 0
+    skipped_before_cursor = 0
+    for issue in _search(service, jql, get=get, max_results=max_results):
+        key = issue.get("key")
+        if not key:
+            skipped_no_key += 1  # one malformed row must not sink the whole run
+            continue
+        updated = ((issue.get("fields") or {}).get("updated")) or ""
+        at = _parse_jira_time(updated)
+        if at is None:
+            skipped_unparsable += 1  # unparsable timestamp can't become a cursor value
+            continue
+        if cursor_at is not None and at <= cursor_at:
+            # The contract's actual enforcement point (§5.3) — never trust
+            # the JQL bound alone. `_since_clause` only widens the search
+            # enough to not miss anything; this is what guarantees "cursor
+            # より後だけを返す".
+            skipped_before_cursor += 1
+            continue
+        occurred_at = _to_rfc3339(at)
+        rows.append(
+            {
+                "id": f"{key}:{occurred_at}",
+                "occurred_at": occurred_at,
+                "identity": f"jira:{key}",
+                "url": f"{site_base_url}/browse/{key}" if site_base_url else "",
+                "_sort_key": (at, key),
+            }
+        )
+    rows.sort(key=lambda r: r["_sort_key"])
+    for row in rows:
+        del row["_sort_key"]
+    total_skipped = skipped_no_key + skipped_unparsable + skipped_before_cursor
+    if total_skipped:
+        print(
+            f"assigned-issues: skipped {total_skipped} issue(s) while collecting "
+            f"(no_key={skipped_no_key} unparsable_updated={skipped_unparsable} "
+            f"before_cursor={skipped_before_cursor})",
+            file=sys.stderr,
+        )
+    return rows
+
+
+def get_cursor(*, run: Any = subprocess.run) -> str:
+    """Read this connector's own bookmark via ``boid signal cursor`` —
+    never a local file (the Pack contract change from the migration
+    source's ``FileBookmarks``). Takes no arguments: the shim resolves
+    which (service, connector) to read from ``BOID_SIGNAL_SERVICE`` /
+    ``BOID_SIGNAL_CONNECTOR`` in this process's own environment.
+    """
+    proc = run(["boid", "signal", "cursor"], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"boid signal cursor: {proc.stderr.strip()}")
+    data = json.loads(proc.stdout)
+    return str(data.get("cursor") or "")
+
+
+def ingest_signals(rows: Sequence[Mapping[str, Any]], *, run: Any = subprocess.run, chunk_size: int = INGEST_CHUNK_SIZE) -> None:
+    """Write ``rows`` to ``boid signal ingest`` as JSONL, one line per row,
+    in the order given (the caller — ``collect_envelopes`` — is
+    responsible for oldest-first ordering; this function does not
+    re-sort). Splits into ``chunk_size``-row calls; each call is its own
+    transaction, so a crash partway through still leaves the cursor
+    advanced correctly for whatever was ingested so far.
+    """
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        payload = "\n".join(json.dumps(dict(row), ensure_ascii=False) for row in chunk) + "\n"
+        proc = run(["boid", "signal", "ingest"], input=payload, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"boid signal ingest: {proc.stderr.strip()}")
+
+
+def main() -> int:
+    service = os.environ.get("BOID_SIGNAL_SERVICE") or ""
+    if not service:
+        print("assigned-issues: BOID_SIGNAL_SERVICE is not set", file=sys.stderr)
+        return 1
+
+    config_raw = os.environ.get("BOID_SIGNAL_CONFIG") or "{}"
+    try:
+        config = json.loads(config_raw)
+    except ValueError as e:
+        print(f"assigned-issues: BOID_SIGNAL_CONFIG is not valid JSON: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(config, dict):
+        print("assigned-issues: BOID_SIGNAL_CONFIG must be a JSON object", file=sys.stderr)
+        return 1
+    base_jql = str(config.get("jql") or DEFAULT_JQL)
+    max_results = int(config.get("max_results") or DEFAULT_MAX_RESULTS)
+    initial_window_days = float(config.get("initial_window_days") or DEFAULT_INITIAL_WINDOW_DAYS)
+
+    # Every failure from here on is surfaced (message on stderr, exit 1),
+    # never swallowed — a connector's non-zero exit is what feeds boid's
+    # existing failStreak notification (§5.3, §7.1's "実行保証" row).
+    try:
+        # `get=gateway_get` / `run=subprocess.run` are passed explicitly
+        # here (rather than relying on collect_envelopes'/get_cursor's own
+        # default parameter values) so a test can monkeypatch this
+        # module's `gateway_get`/`subprocess` globals and have main() pick
+        # up the replacement — a default argument value is bound once, at
+        # function-definition time, so patching the module-level name
+        # after the fact would not otherwise reach a call that omits the
+        # keyword.
+        cursor_at = parse_cursor(get_cursor(run=subprocess.run))
+        rows = collect_envelopes(
+            service=service,
+            base_jql=base_jql,
+            cursor_at=cursor_at,
+            now=datetime.now(timezone.utc),
+            max_results=max_results,
+            initial_window_days=initial_window_days,
+            get=gateway_get,
+        )
+        if rows:
+            ingest_signals(rows, run=subprocess.run)
+    except Exception as e:  # top-level boundary: convert to message + exit 1
+        print(f"assigned-issues: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

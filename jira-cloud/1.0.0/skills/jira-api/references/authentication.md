@@ -59,13 +59,7 @@ services:
 
 **Jiraの場合は他のサービスより注意が要る。** ゲートウェイのサービス定義は「1サービス名 = 1 `base_url` + 1 `username`」で固定されるため、**複数のAtlassianサイトや複数のアカウントを使い分けている環境では、サイトごとに別のサービス名が登録される**（例: `jira-api` と `jira-api-<識別子>`）。しかもワークスペースごとにどれが有効化されているかが違う。
 
-確認方法:
-
-```bash
-# ホスト側（boid CLIを直接叩ける環境）から
-boid config get                        # services: ブロック全体
-boid workspace services list <slug>    # そのワークスペースで有効なサービス名
-```
+確認方法: 運用者はホスト側で `config.yaml` の `services:` ブロックと、ワークスペースごとの有効化状況を確認できる。
 
 サンドボックス内からは `config.yaml` は見えない。**サービス名を決め打ちして403が返ったら、名前が違う可能性を最初に疑うこと。** サンドボックス内からでも `/rest/api/3/myself` を候補名で総当たりすれば特定できる — 手順は [pagination-and-errors.md](pagination-and-errors.md) の「サービス名を突き止める」を参照。それでも分からなければユーザーに確認する。
 

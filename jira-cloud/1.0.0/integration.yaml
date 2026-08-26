@@ -1,0 +1,32 @@
+apiVersion: boid.dev/v1
+kind: IntegrationPack
+metadata:
+  name: jira-cloud
+  version: 1.0.0
+
+serviceProfiles:
+  - name: jira-cloud
+    endpoint:
+      configurable: true
+    credentials:
+      - name: token
+        injection: bearer
+
+connectors:
+  - name: assigned-issues
+    executable: connectors/assigned-issues
+    serviceProfile: jira-cloud
+    configSchema:
+      type: object
+      properties:
+        jql:
+          type: string
+        max_results:
+          type: number
+        initial_window_days:
+          type: number
+
+skills:
+  - name: jira-api
+    path: skills/jira-api
+    requiresServiceProfile: jira-cloud
