@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""bitbucket-cloud Integration Pack — connector "pr-comments".
+
+Watches comments on the caller's own **open** pull requests in one Bitbucket
+Cloud workspace and turns each new comment into a boid Signal envelope
+(`boid signal ingest`, JSONL, see the module-level `_build_envelope`).
+
+Ported from khi-task-collector's `khi/adapters/bitbucket.py`
+(`BitbucketSignals`) per docs/plans/signal-ingest-detailed-design.md §10 —
+same search strategy, same event-key/identity scheme, same 429-avoidance
+fix. What changed for the Pack form:
+
+- workspace is no longer a hardcoded constant — it comes from
+  `BOID_SIGNAL_CONFIG.workspace` (this Pack has no single dogfood tenant)
+- the source's own instance name/pack/connector fields are NOT emitted by
+  this script — the daemon composes the envelope's `source` block from
+  `BOID_SIGNAL_SERVICE`/`BOID_SIGNAL_CONNECTOR` itself (contract §5.3)
+- the cursor is `boid signal cursor`/`boid signal ingest` (subprocess calls
+  against the boid CLI already on PATH inside the connector's sandbox),
+  not a local `~/.local/state/khi/bookmarks.json` file
+- PR comment body (`content.raw`) is never fetched at all — the khi
+  adapter already dropped it (judgment reads the PR itself, live, via the
+  bitbucket-api reference skill); this port carries that forward
+
+## Why comments, not `updated_on`
+
+A PR's `updated_on` looks like the obvious "what changed" signal, but it
+also moves on the PR author's OWN pushes — and a push has no author field
+to filter against, so a child task iterating on its own PR would trigger
+this connector on every commit. Comments always carry `user`, so
+self-authored ones can be told apart from everyone else's. This is why
+Bitbucket is the one source (of slack/jira/bitbucket) that still walks a
+comment list per PR rather than a single "what's new" query.
+
+## The 429 bug this port must NOT reintroduce
+
+khi's PREVIOUS implementation queried Bitbucket with `q=author.uuid="..."`
+scoped per-repo (245 repos in the real workspace) AND tried to add
+`state=OPEN` alongside it. Bitbucket Cloud silently ignores `state` when a
+`q=` filter is present — so despite asking for open PRs only, every
+comment across every PR state (open, merged, declined — measured 101 of
+them, vs. 9 actually open) got re-fetched every cycle. That inflation (not
+the per-repo listing itself) was the dominant contributor to a measured
+~350 requests/cycle, the proximate cause of repeated 429s.
+
+The fix carried forward here: use Bitbucket Cloud's cross-workspace
+endpoint, `GET /workspaces/{workspace}/pullrequests/{selected_user}`,
+which accepts `state=OPEN` *without* any `q=` filter at all — so there is
+no `q=`+`state=` combination for Bitbucket to silently collapse. This
+single endpoint also replaces listing all repos in the workspace and
+querying each one individually (245 extra requests/cycle in the old
+implementation). Measured effect in khi: ~350 -> ~11 requests/cycle.
+**Do not add a `q=` parameter to `_list_my_open_prs` below** — that is
+exactly the combination this whole rewrite exists to avoid.
+
+## The cursor contract (signal-ingest-detailed-design.md §5.3)
+
+"cursor より後だけを返す。外部検索の精度に任せず、取得後に
+`occurred_at <= cursor` を自分で落とす" — Bitbucket's own pagination/
+ordering is not trusted as the filter. `fetch()` asks for everything (no
+server-side time filter exists here anyway) and drops anything at-or-
+before the cursor itself, in Python, after fetching. Duplicates re-sent
+past the cursor are fine (`boid signal ingest` dedups by
+(workspace, service, connector, id)); silently skipping something is not.
+
+Standard library only (`urllib.request`/`ssl`/`json`, plus `subprocess` for
+the two boid CLI calls) — this file has no dependencies to install, and the
+project sandbox running it is not guaranteed to have anything beyond
+python3 itself (§5.3: "公式 Pack v0 は python3 前提").
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from typing import Any, Mapping, Sequence
+from urllib.parse import parse_qsl, urlsplit
+
+#: "自分自身" の共有語彙 (signal-driven-review.md §5.2: "self は「自分自身」の共有語彙")。
+SELF = "self"
+
+#: `[A-Z][A-Z0-9]{1,9}-[0-9]+` — Jira issue key の書式。khi/adapters/bitbucket.py と同一。
+_JIRA_KEY_RE = re.compile(r"[A-Z][A-Z0-9]{1,9}-[0-9]+")
+
+#: ページングの安全上限。1 回の応答が異常に多いことへの安全弁であって、正しさの根拠には
+#: しない — 打ち切っても cursor は「実際に ingest した分」までしか進まないので、次回の
+#: 巡が取りこぼした続きを拾う (khi 実装からの継承)。
+MAX_PAGES = 20
+
+#: 1 回の `boid signal ingest` 呼び出しに乗せる envelope の最大件数。ページングと同じ
+#: 理由で分割する (契約 §5.3: 「ページングは ingest を複数回呼んでよい」) — 1 回の
+#: stdin ペイロードを小さく保ち、途中で落ちても直前までの分の cursor は前進している
+#: ようにする。
+INGEST_BATCH_SIZE = 200
+
+#: gateway 呼び出し全体のタイムアウト (秒)。connector は every=数分間隔で起こされるので、
+#: 1 呼び出しがそれより長く刺さっては困る (khi/adapters/gateway.py の値を踏襲)。
+GATEWAY_TIMEOUT_SECONDS = 30
+
+
+class GatewayError(Exception):
+    """gateway 越しの HTTP 呼び出しが非 2xx で終わったとき、または `BOID_API_BASE` が
+    未設定のときの例外。**握り潰さず、そのまま connector を非ゼロ終了させる** —
+    契約 (§5.3) の「失敗: 握り潰さない — failStreak に乗せる」をここで実現する。
+    """
+
+    def __init__(self, service: str, path: str, status: int, body: str) -> None:
+        self.service = service
+        self.path = path
+        self.status = status
+        self.body = body
+        snippet = body if len(body) <= 500 else body[:500] + "…"
+        super().__init__(f"boid API gateway: {service}{path} -> HTTP {status}: {snippet}")
+
+
+def _base_url() -> str:
+    base = os.environ.get("BOID_API_BASE")
+    if not base:
+        raise GatewayError("", "", 0, "BOID_API_BASE is not set")
+    return base.rstrip("/")
+
+
+def _ssl_context() -> "ssl.SSLContext | None":
+    cafile = os.environ.get("BOID_API_CA_FILE")
+    if not cafile:
+        return None
+    return ssl.create_default_context(cafile=cafile)
+
+
+def gateway_get(
+    service: str,
+    path: str,
+    params: "Mapping[str, str] | None" = None,
+    *,
+    urlopen: Any = urllib.request.urlopen,
+) -> Any:
+    """`$BOID_API_BASE/<service><path>` へ 1 回 GET する — connector が到達してよい先は
+    契約上ここだけ (§5.3: 「外部 fetch: `$BOID_API_BASE/$BOID_SIGNAL_SERVICE/...` のみ」)。
+    ポート先は khi/adapters/gateway.py の `get`/`request` と同じ形にしてある。
+    """
+    url = f"{_base_url()}/{service}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urlopen(req, context=_ssl_context(), timeout=GATEWAY_TIMEOUT_SECONDS) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise GatewayError(service, path, e.code, body) from e
+    except urllib.error.URLError as e:
+        raise GatewayError(service, path, 0, str(e.reason)) from e
+
+    if not raw:
+        return {}
+    text = raw.decode("utf-8")
+    if not text.strip():
+        return {}
+    return json.loads(text)
+
+
+def _parse_time(value: str) -> "datetime | None":
+    """**tz の無い値は UTC と読む.** 空文字・読めない値は `None` (= 下限なし / 最初から)。
+    Bitbucket の `created_on` を栞 (`boid signal cursor` の戻り値) と同じ関数で解釈する —
+    片方だけ扱いが違うと栞比較がずれる。
+    """
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _to_rfc3339(dt: datetime) -> str:
+    """tz-aware な `dt` を UTC・`Z` サフィックスの RFC3339 文字列にする — envelope の
+    `occurred_at` の書式 (signal-envelope-inventory.md §3.3 の実例と同型)。この形にそろえる
+    ことで、`fetch()` の最終ソートは envelope 辞書の `occurred_at` の**文字列比較**だけで
+    時系列順と一致する。
+    """
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _extract_jira_key(*texts: "str | None") -> "str | None":
+    """PR のブランチ名・タイトルから Jira issue key を抽出する。**identity は
+    workspace 全体の共有語彙** (signal-driven-review.md §5.2) — ここで `jira:<KEY>` を
+    出すことで、PR コメントと Jira 課題の Signal が同じ `identity` に合流する
+    (本番実績、signal-envelope-inventory.md §3.3)。
+    """
+    for text in texts:
+        if not text:
+            continue
+        m = _JIRA_KEY_RE.search(text)
+        if m:
+            return m.group(0)
+    return None
+
+
+def _repo_slug_of(pull: dict) -> "str | None":
+    """workspace 横断 PR 一覧の 1 件から、コメント一覧を引くための repo slug を導く。
+
+    PR は常に **destination 側 repo** の名前空間に住む (fork からの PR でも
+    `/repositories/{workspace}/{repo_slug}/pullrequests/{id}` は destination 側の slug で
+    引ける) ので `source` ではなく `destination.repository` を見る。読めない場合は `None`
+    — jira key が取れない PR と同じ「合流先を特定できない」扱いで捨てる。
+    """
+    full_name = ((pull.get("destination") or {}).get("repository") or {}).get("full_name")
+    if not full_name:
+        return None
+    _workspace, separator, slug = full_name.partition("/")
+    return slug if separator and slug else None
+
+
+def _split_next_url(next_url: str) -> "tuple[str, dict[str, str]]":
+    """Bitbucket の `next` は絶対 URL (`https://api.bitbucket.org/2.0/...`)。gateway 経由で
+    叩き直せるようパスとクエリへ分解する。gateway の base_url は `/2.0` を含むので、その
+    prefix を剥がす — 剥がし損ねると `path` に `/2.0` が二重に残り、次のページ取得が
+    404 する (khi の旧実装がこれで `/workspaces/...` 系のページングを壊していた)。
+    """
+    parts = urlsplit(next_url)
+    path = parts.path
+    idx = path.find("/2.0/")
+    if idx >= 0:
+        path = path[idx + len("/2.0") :]
+    return path, dict(parse_qsl(parts.query))
+
+
+class BitbucketPRComments:
+    """`pr-comments` connector 本体。1 回の `fetch()` 呼び出しが 1 巡ぶんの envelope 列を
+    返す (副作用は `get` 経由の HTTP だけ — cursor の読み書きは `main()` 側の責務)。
+    """
+
+    def __init__(
+        self,
+        *,
+        service: str,
+        workspace: str,
+        my_uuid: "str | None" = None,
+        my_display_name: str = "",
+        get: Any = gateway_get,
+        comment_page_len: int = 50,
+    ) -> None:
+        self._service = service
+        self._workspace = workspace
+        self._my_uuid = my_uuid
+        self._my_display_name = my_display_name
+        self._get = get
+        self._comment_page_len = comment_page_len
+
+    def fetch(self, cursor: str) -> "list[dict]":
+        """栞 (`cursor`) より後の PR コメントを、古い順の envelope dict 列で返す。**例外は
+        投げっぱなし** (`GatewayError` は `main()` が拾って非ゼロ終了する — 契約の
+        「握り潰さない」)。
+        """
+        if self._my_uuid is None:
+            self._my_uuid = self._fetch_my_uuid()
+
+        after = _parse_time(cursor)
+        envelopes: "list[dict]" = []
+        for pull in self._list_my_open_prs():
+            repo_slug = _repo_slug_of(pull)
+            if repo_slug is None:
+                # コメントを引く経路 (repo slug) が組めない PR は候補にしない。
+                continue
+            jira_key = _extract_jira_key(
+                ((pull.get("source") or {}).get("branch") or {}).get("name"),
+                pull.get("title"),
+            )
+            if not jira_key:
+                # 合流先の Jira 課題が特定できない PR は候補にしない (khi からの継承)。
+                continue
+            envelopes.extend(self._comment_envelopes(repo_slug, pull, jira_key, after))
+        # 栞の契約は「古い順に前進」— 複数 PR をまたいで並べ直す。ingest 側も
+        # oldest-first で呼ぶ必要がある (§5.3) ため、ここで確定させておく。
+        envelopes.sort(key=lambda e: e["occurred_at"])
+        return envelopes
+
+    def _comment_envelopes(self, repo_slug: str, pull: dict, jira_key: str, after: "datetime | None") -> "list[dict]":
+        pr_id = pull.get("id")
+        url = ((pull.get("links") or {}).get("html") or {}).get("href")
+        out: "list[dict]" = []
+        for c in self._list_comments(repo_slug, pr_id):
+            created_at = _parse_time(c.get("created_on", ""))
+            if created_at is None:
+                # `created_on` はそのまま occurred_at になる。読めない値は通さない。
+                continue
+            if after is not None and created_at <= after:
+                # **栞の契約そのもの**: 外部検索の精度に任せず、取得後にここで自分で落とす。
+                continue
+            display_name = (c.get("user") or {}).get("display_name") or None
+            author = SELF if display_name and display_name == self._my_display_name else display_name
+            out.append(_build_envelope(repo_slug, pr_id, c.get("id"), created_at, jira_key, url, author))
+        return out
+
+    # -- 一覧系 -----------------------------------------------------------
+
+    def _paged(self, path: str, params: "dict[str, str]") -> "list[dict]":
+        """`next` が尽きるまで `values` を集める。安全上限に達したら**黙って打ち切る**
+        (khi 実装と同じ理由 — 取りこぼしは次巡が拾う。cursor は実際に ingest した分までしか
+        進まないので正しさは保たれる)。
+        """
+        values: "list[dict]" = []
+        current_params: "dict[str, str] | None" = params
+        for _ in range(MAX_PAGES):
+            resp = self._get(self._service, path, current_params)
+            values.extend(resp.get("values") or ())
+            next_url = resp.get("next")
+            if not next_url:
+                break
+            path, current_params = _split_next_url(next_url)
+        return values
+
+    def _list_my_open_prs(self) -> "list[dict]":
+        """workspace 横断で「自分が author の open PR」を 1 経路で取る。**`q=` は使わない**
+        — module docstring の 429 回避策そのもの。`state=OPEN` だけで絞れる。
+        """
+        return self._paged(
+            f"/workspaces/{self._workspace}/pullrequests/{self._my_uuid}",
+            {"state": "OPEN", "pagelen": "50"},
+        )
+
+    def _list_comments(self, repo_slug: str, pr_id: Any) -> "list[dict]":
+        return self._paged(
+            f"/repositories/{self._workspace}/{repo_slug}/pullrequests/{pr_id}/comments",
+            {"pagelen": str(self._comment_page_len)},
+        )
+
+    def _fetch_my_uuid(self) -> str:
+        resp = self._get(self._service, "/user")
+        uuid = resp.get("uuid")
+        if not uuid:
+            raise GatewayError(self._service, "/user", 0, "response has no \"uuid\" field")
+        if not self._my_display_name:
+            self._my_display_name = resp.get("display_name", "")
+        return uuid
+
+
+def _build_envelope(
+    repo_slug: str,
+    pr_id: Any,
+    comment_id: Any,
+    created_at: datetime,
+    jira_key: str,
+    url: "str | None",
+    author: "str | None",
+) -> dict:
+    """envelope v0 の 1 行を組み立てる (signal-driven-review.md §5.2)。`source` ブロックは
+    ここでは**書かない** — daemon が `BOID_SIGNAL_SERVICE`/`BOID_SIGNAL_CONNECTOR` から
+    合成する (契約 §5.3)。`id` の書式は khi の `bitbucket_comment_event` を踏襲:
+    `bitbucket:<repo_slug>:<pr_id>:comment:<comment_id>` — PR 単位ではなくコメント単位に
+    することで、自分の push で `updated_on` が動くだけでは Signal が立たない。
+    """
+    envelope: dict = {
+        "id": f"bitbucket:{repo_slug}:{pr_id}:comment:{comment_id}",
+        "occurred_at": _to_rfc3339(created_at),
+        "identity": f"jira:{jira_key}",
+    }
+    if url:
+        envelope["url"] = url
+    if author is not None:
+        envelope["author"] = author
+    return envelope
+
+
+def read_cursor(*, runner: Any = subprocess.run) -> str:
+    """`boid signal cursor` を呼び、この connector 自身の source cursor を返す。source/
+    service のスコープは呼び出し元プロセス自身の env (`BOID_SIGNAL_SERVICE`/
+    `BOID_SIGNAL_CONNECTOR`) から決まる — この関数は引数で渡さない (契約 §3.2: 「ingest/
+    cursor の source/service は引数でなく env から取る」)。cursor が無ければ空文字
+    (`GetSignalCursor` の「無ければ空文字」契約) — `_parse_time("")` がそれを「下限なし」
+    として読む。
+    """
+    result = runner(["boid", "signal", "cursor"], capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
+def ingest_rows(rows: "Sequence[dict]", *, runner: Any = subprocess.run) -> None:
+    """`rows` (すでに occurred_at 昇順) を JSONL にして `boid signal ingest` の stdin へ
+    書き込む。1 回の呼び出しが 1 tx — 複数バッチに分けて複数回呼んでも、**呼び出し順を
+    昇順のまま保つ**限り、途中で落ちても cursor は「ingest 済みの分」までしか進まない
+    (契約 §5.3)。空リストは何もしない (無駄な subprocess 起動を避ける)。
+    """
+    if not rows:
+        return
+    payload = "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows) + "\n"
+    runner(["boid", "signal", "ingest"], input=payload, text=True, check=True)
+
+
+def _chunks(rows: "Sequence[dict]", size: int) -> "list[Sequence[dict]]":
+    return [rows[i : i + size] for i in range(0, len(rows), size)]
+
+
+def main() -> int:
+    service = os.environ.get("BOID_SIGNAL_SERVICE")
+    if not service:
+        print("pr-comments: BOID_SIGNAL_SERVICE is not set", file=sys.stderr)
+        return 1
+
+    try:
+        config = json.loads(os.environ.get("BOID_SIGNAL_CONFIG") or "{}")
+    except json.JSONDecodeError as e:
+        print(f"pr-comments: BOID_SIGNAL_CONFIG is not valid JSON: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(config, dict):
+        print("pr-comments: BOID_SIGNAL_CONFIG must decode to a JSON object", file=sys.stderr)
+        return 1
+
+    workspace = config.get("workspace")
+    if not workspace:
+        print("pr-comments: config.workspace is required (see integration.yaml configSchema)", file=sys.stderr)
+        return 1
+
+    try:
+        cursor = read_cursor()
+    except subprocess.CalledProcessError as e:
+        print(f"pr-comments: \"boid signal cursor\" failed: {e}", file=sys.stderr)
+        return 1
+
+    connector = BitbucketPRComments(service=service, workspace=workspace)
+    try:
+        envelopes = connector.fetch(cursor)
+    except GatewayError as e:
+        print(f"pr-comments: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        for batch in _chunks(envelopes, INGEST_BATCH_SIZE):
+            ingest_rows(batch)
+    except subprocess.CalledProcessError as e:
+        print(f"pr-comments: \"boid signal ingest\" failed: {e}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,51 @@
+apiVersion: boid.dev/v1
+kind: IntegrationPack
+metadata:
+  name: bitbucket-cloud
+  version: 1.0.0
+
+serviceProfiles:
+  - name: bitbucket-cloud
+    # Bitbucket Cloud's REST API base URL (https://api.bitbucket.org/2.0) is
+    # fixed by the vendor, not per-tenant. v0's loader (internal/
+    # integrationpack/resolve.go, DesugarService) has no Pack-declared
+    # default-endpoint mechanism yet, though — a "configurable: false"
+    # profile cannot be used by any `uses:` service entry at all in v0 (it
+    # is rejected outright: "v0 has no Pack-declared default endpoint to
+    # fall back to"). So this profile declares `configurable: true` and
+    # leaves the (structurally fixed, but not yet Pack-expressible) default
+    # to the operator's config.yaml `endpoint: https://api.bitbucket.org/2.0`
+    # — same value every operator will use, just written once per instance
+    # instead of baked into this manifest.
+    endpoint:
+      configurable: true
+    credentials:
+      # Bitbucket Cloud's documented Basic-auth-with-API-token convention:
+      # HTTP Basic with the fixed username "x-bitbucket-api-token-auth" and
+      # the API token as the password. See skills/bitbucket-api/references/
+      # authentication.md (this Pack's own reference skill) for the
+      # operator-facing writeup this slot mirrors.
+      - name: token
+        injection: basic
+        username: x-bitbucket-api-token-auth
+
+connectors:
+  - name: pr-comments
+    executable: connectors/pr-comments
+    serviceProfile: bitbucket-cloud
+    configSchema:
+      type: object
+      properties:
+        # Bitbucket Cloud workspace slug to search within (e.g. the
+        # `AoLani-ondemand` in `https://bitbucket.org/AoLani-ondemand/...`).
+        # No hardcoded default — unlike the khi-task-collector adapter this
+        # connector was ported from, a Pack has no single dogfood tenant.
+        workspace:
+          type: string
+      required:
+        - workspace
+
+skills:
+  - name: bitbucket-api
+    path: skills/bitbucket-api
+    requiresServiceProfile: bitbucket-cloud
