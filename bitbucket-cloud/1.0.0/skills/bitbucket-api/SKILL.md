@@ -28,7 +28,7 @@ Bitbucket Cloud API自体の素のベースURLは `https://api.bitbucket.org/2.0
 
 3. ゲートウェイは以下を行う:
    - リクエストパス `/api/<job-token>/<service>/<tail>` をパースし、job tokenを検証する
-   - `<service>` がそのjob tokenに許可されたサービス集合に含まれるかを確認する。**`services:` に定義しただけでは足りず、ワークスペース側で当該サービスを有効化していないと403になる**（`boid workspace services add` 等。詳細は [references/pagination-and-errors.md](references/pagination-and-errors.md)）
+   - `<service>` がそのjob tokenに許可されたサービス集合に含まれるかを確認する。**`services:` に定義しただけでは足りず、ワークスペース側で当該サービスを有効化していないと403になる**（有効化の操作自体はこのスキルの範囲外。詳細は [references/pagination-and-errors.md](references/pagination-and-errors.md)）
    - read-only jobの場合、GET/HEAD以外のメソッド（POST/PUT/DELETE等）は問答無用で403になる。PR作成・コメント投稿・承認・マージなど書き込み系操作をread-only jobから呼ぶことはできない
    - **クライアントが送った `Authorization` / `Cookie` / `Proxy-Authorization` ヘッダは必ず剥がして無視する**（サンドボックス側が本物の資格情報を持つことは想定されていない）
    - `services.<service>.auth` の設定に従って実際の認証情報をシークレットストアから解決し、注入してから実際の `base_url`（`https://api.bitbucket.org/2.0`）に転送する
