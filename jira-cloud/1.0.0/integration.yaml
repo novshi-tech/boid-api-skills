@@ -23,6 +23,8 @@ connectors:
           type: string
         max_results:
           type: number
+        initial_window_days:
+          type: number
 
 skills:
   - name: jira-api

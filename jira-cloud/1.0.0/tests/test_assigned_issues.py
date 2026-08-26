@@ -13,8 +13,10 @@ than a normal package import.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import sys
 import unittest
@@ -135,8 +137,23 @@ class ParseCursorTest(unittest.TestCase):
 
 
 class SinceClauseTest(unittest.TestCase):
-    def test_no_cursor_means_no_clause(self):
-        self.assertIsNone(connector._since_clause(None, T0))
+    def test_no_cursor_falls_back_to_the_initial_window(self):
+        """B3 fix: an empty cursor must never mean an unbounded search — an
+        unbounded first run that exceeds MAX_SEARCH_PAGES raises before
+        ever ingesting anything, which means the cursor never advances and
+        the NEXT run repeats the identical unbounded search forever, since
+        boid has no way to seed a cursor out-of-band.
+        """
+        clause = connector._since_clause(None, T0)
+        self.assertEqual(clause, 'updated >= "-30d"')
+
+    def test_initial_window_days_is_configurable(self):
+        clause = connector._since_clause(None, T0, initial_window_days=7)
+        self.assertEqual(clause, 'updated >= "-7d"')
+
+    def test_initial_window_has_a_floor_of_one_day(self):
+        clause = connector._since_clause(None, T0, initial_window_days=0)
+        self.assertEqual(clause, 'updated >= "-1d"')
 
     def test_relative_minutes_not_absolute_date(self):
         """The whole point of the relative-minutes design (see the
@@ -145,33 +162,65 @@ class SinceClauseTest(unittest.TestCase):
         """
         cursor = T0 - timedelta(minutes=30)
         clause = connector._since_clause(cursor, T0)
-        self.assertEqual(clause, 'updated >= "-30m"')
+        # +1 minute safety margin (F1) on top of the exact elapsed time.
+        self.assertEqual(clause, 'updated >= "-31m"')
 
-    def test_rounds_up_and_has_a_floor_of_one_minute(self):
+    def test_rounds_up_and_adds_a_one_minute_safety_margin(self):
+        """F1 fix: `ceil(elapsed/60)` alone can round up to exactly the
+        true elapsed minutes with zero slack left for request latency or
+        clock skew between this process and the daemon that stamped the
+        cursor — the extra `+ 1` is that slack.
+        """
         cursor = T0 - timedelta(seconds=10)
         clause = connector._since_clause(cursor, T0)
-        self.assertEqual(clause, 'updated >= "-1m"')
+        self.assertEqual(clause, 'updated >= "-2m"')  # ceil(10/60)=1, +1=2
 
         cursor2 = T0 - timedelta(minutes=2, seconds=1)
         clause2 = connector._since_clause(cursor2, T0)
-        self.assertEqual(clause2, 'updated >= "-3m"')
+        self.assertEqual(clause2, 'updated >= "-4m"')  # ceil(121/60)=3, +1=4
+
+    def test_zero_elapsed_still_gets_the_one_minute_margin(self):
+        clause = connector._since_clause(T0, T0)  # elapsed == 0
+        self.assertEqual(clause, 'updated >= "-1m"')  # ceil(0/60)=0, +1=1
 
 
 class BuildJqlTest(unittest.TestCase):
-    def test_default_jql_with_no_cursor(self):
+    def test_default_jql_with_no_cursor_uses_the_initial_window(self):
         jql = connector._build_jql(connector.DEFAULT_JQL, None, T0)
-        self.assertEqual(jql, "assignee = currentUser() ORDER BY updated ASC")
+        self.assertEqual(jql, 'assignee = currentUser() AND updated >= "-30d" ORDER BY updated ASC')
 
-    def test_config_jql_overrides_default(self):
+    def test_config_jql_overrides_the_default_base_filter(self):
+        """The override replaces only the base filter (`assignee =
+        currentUser()`) — the cursor/initial-window bound and the trailing
+        ORDER BY are still appended by this connector regardless.
+        """
         jql = connector._build_jql('project = PROJ AND assignee = currentUser()', None, T0)
         self.assertTrue(jql.startswith("project = PROJ AND assignee = currentUser()"))
-        self.assertNotIn("updated >=", jql)
+        self.assertIn('updated >= "-30d"', jql)
 
     def test_cursor_adds_since_clause(self):
         cursor = T0 - timedelta(minutes=10)
         jql = connector._build_jql(connector.DEFAULT_JQL, cursor, T0)
-        self.assertIn('updated >= "-10m"', jql)
+        self.assertIn('updated >= "-11m"', jql)  # +1 minute margin, F1
         self.assertTrue(jql.endswith("ORDER BY updated ASC"))
+
+    def test_initial_window_days_is_threaded_through(self):
+        jql = connector._build_jql(connector.DEFAULT_JQL, None, T0, initial_window_days=14)
+        self.assertIn('updated >= "-14d"', jql)
+
+    def test_base_jql_with_its_own_order_by_is_rejected(self):
+        """F4 fix: this connector always appends its own trailing `ORDER BY
+        updated ASC` (required for oldest-first ingest, §5.3) — a
+        `config.jql` that already has one would otherwise make every
+        search a 400 (Jira rejects two ORDER BY clauses), with no clue why.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            connector._build_jql("project = PROJ ORDER BY created DESC", None, T0)
+        self.assertIn("ORDER BY", str(ctx.exception))
+
+    def test_order_by_rejection_is_case_insensitive(self):
+        with self.assertRaises(ValueError):
+            connector._build_jql("project = PROJ order by created desc", None, T0)
 
 
 class CollectEnvelopesTest(unittest.TestCase):
@@ -209,8 +258,13 @@ class CollectEnvelopesTest(unittest.TestCase):
         (row,) = rows
         self.assertEqual(set(row.keys()), {"id", "occurred_at", "identity", "url"})
         self.assertEqual(row["identity"], "jira:X-1")
-        self.assertEqual(row["id"], "X-1:2026-08-22T09:00:00.000+0900")
         self.assertEqual(row["occurred_at"], "2026-08-22T00:00:00Z")
+        # F2: `id` is built from the SAME normalized value as `occurred_at`
+        # — never Jira's raw (account-timezone-rendered) `updated` string,
+        # since a changed account timezone setting would otherwise change
+        # `id` for the very same event and silently break dedup.
+        self.assertEqual(row["id"], "X-1:2026-08-22T00:00:00Z")
+        self.assertEqual(row["id"], f"X-1:{row['occurred_at']}")
 
     def test_browse_url_is_derived_from_the_myself_self_field(self):
         fake = _FakeGet(
@@ -262,6 +316,47 @@ class CollectEnvelopesTest(unittest.TestCase):
 
         with self.assertRaises(connector.GatewayError):
             connector.collect_envelopes(service="jira-api", base_jql=connector.DEFAULT_JQL, cursor_at=None, now=T0, get=raising_get)
+
+
+class SkipCountingTest(unittest.TestCase):
+    """F3 fix: dropped rows (no key / unparsable timestamp / before cursor)
+    are counted and, if any were dropped, summarized on stderr — visibility
+    for a systemic cause (e.g. Jira's timestamp format changing, silently
+    zeroing every row via the unparsable-timestamp branch) that would
+    otherwise show up only as "this connector exits 0 but nothing ever
+    arrives", tripping no failure detection at all.
+    """
+
+    def test_no_skips_prints_nothing(self):
+        fake = _FakeGet(page(issue()))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            connector.collect_envelopes(service="jira-api", base_jql=connector.DEFAULT_JQL, cursor_at=None, now=T0, get=fake)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_unparsable_timestamps_are_reported_on_stderr(self):
+        fake = _FakeGet(page(issue(updated="not a time")))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            connector.collect_envelopes(service="jira-api", base_jql=connector.DEFAULT_JQL, cursor_at=None, now=T0, get=fake)
+        output = stderr.getvalue()
+        self.assertIn("skipped 1", output)
+        self.assertIn("unparsable_updated=1", output)
+
+    def test_missing_key_is_reported_on_stderr(self):
+        fake = _FakeGet(page({"fields": {"updated": "2026-08-22T09:00:00.000+0900"}}))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            connector.collect_envelopes(service="jira-api", base_jql=connector.DEFAULT_JQL, cursor_at=None, now=T0, get=fake)
+        self.assertIn("no_key=1", stderr.getvalue())
+
+    def test_before_cursor_skips_are_reported_on_stderr(self):
+        at = T0 - timedelta(hours=1)
+        fake = _FakeGet(page(issue(updated="2026-08-21T23:00:00.000+0000")))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            connector.collect_envelopes(service="jira-api", base_jql=connector.DEFAULT_JQL, cursor_at=at, now=T0, get=fake)
+        self.assertIn("before_cursor=1", stderr.getvalue())
 
 
 class GetCursorTest(unittest.TestCase):
@@ -373,6 +468,38 @@ class MainTest(unittest.TestCase):
         run = _FakeRun(cursor="", ingest_returncode=1, ingest_stderr="ingest exploded")
         exit_code = self._run_main({"BOID_SIGNAL_SERVICE": "jira-api"}, get, run)
         self.assertEqual(exit_code, 1)
+
+    def test_initial_window_days_config_is_honored(self):
+        """B3 fix end-to-end: a first run (empty cursor) with a custom
+        `initial_window_days` actually narrows the search bound sent to
+        Jira, not just when calling `_since_clause` directly.
+        """
+        get = _FakeGet(page())
+        run = _FakeRun(cursor="")
+        env = {
+            "BOID_SIGNAL_SERVICE": "jira-api",
+            "BOID_SIGNAL_CONFIG": json.dumps({"initial_window_days": 3}),
+        }
+        exit_code = self._run_main(env, get, run)
+        self.assertEqual(exit_code, 0)
+        self.assertIn('updated >= "-3d"', get.search_params["jql"])
+
+    def test_default_first_run_window_is_thirty_days(self):
+        get = _FakeGet(page())
+        run = _FakeRun(cursor="")
+        self._run_main({"BOID_SIGNAL_SERVICE": "jira-api"}, get, run)
+        self.assertIn('updated >= "-30d"', get.search_params["jql"])
+
+    def test_config_jql_with_order_by_exits_nonzero(self):
+        get = _FakeGet(page())
+        run = _FakeRun(cursor="")
+        env = {
+            "BOID_SIGNAL_SERVICE": "jira-api",
+            "BOID_SIGNAL_CONFIG": json.dumps({"jql": "project = PROJ ORDER BY created DESC"}),
+        }
+        exit_code = self._run_main(env, get, run)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(run.ingest_calls, [])
 
 
 if __name__ == "__main__":  # pragma: no cover
