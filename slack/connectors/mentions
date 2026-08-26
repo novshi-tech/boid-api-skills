@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""slack/mentions connector — new Slack mentions since the source cursor.
+
+Ported from khi-task-collector's `khi/adapters/slack.py` (SlackSignals),
+adapted to the boid Integration Pack connector process contract
+(docs/plans/signal-ingest-detailed-design.md §5.3, §7):
+
+  - the khi version reads its cursor from a local bookmark file
+    (`file_cursor.py`) and returns in-process `Signal` objects to a Python
+    caller; this version reads/advances the cursor via the `boid signal
+    cursor` / `boid signal ingest` CLIs (subprocess) and is itself the
+    process boid execs on a schedule (docs/plans/signal-driven-review.md
+    §8.3's "導出 trigger")
+  - the "gateway.py" HTTP-call pattern (stdlib-only urllib/ssl/json,
+    BOID_API_BASE + BOID_API_CA_FILE, no Authorization header assembled by
+    the caller) is reproduced inline here rather than imported — Pack code
+    is not allowed to depend on khi-task-collector at all (this Pack ships
+    standalone, mounted read-only into a project sandbox that has never
+    heard of khi)
+  - khi's SlackSignals.fetch(since) is a pure function returning Signal
+    objects; here that becomes collect_new_mentions(), which stays
+    injectable (a `get` callable, exactly like khi's own `get=gateway.get`
+    constructor parameter) so slack/tests/test_mentions.py can exercise the
+    filtering/identity/dedup logic with zero network access
+
+What did NOT change from khi's implementation (deliberate, not oversight —
+see each function's own docstring for why):
+
+  - only `search.messages` is called for the actual mention search, never
+    `conversations.replies` — thread bodies are for the judgment task to
+    read live via skills/slack-api, not something a connector should carry
+  - `thread_ts` for `identity` is recovered from the match's own
+    `thread_ts` field first, then the permalink's `?thread_ts=` query
+    parameter, falling back to the message's own `ts` — search.messages
+    hits are not guaranteed to carry `thread_ts` directly (observed
+    2026-08-21 against production Slack)
+  - `author` is always left unset. Slack mentions include a "someone
+    mentioned themselves as a personal TODO" usage pattern, and boid's own
+    self/raw-id normalization (docs/plans/signal-driven-review.md §5.2)
+    only decides WHAT the field says — a workspace's own screening script
+    still decides whether to act on it. khi's slack adapter chose to never
+    populate the field at all specifically so that choice never turns into
+    a screening step's decision to begin with (a self-mention silently
+    dropped by a workspace's own "drop self-authored" script would be
+    exactly the failure mode khi's docstring calls out). This Pack keeps
+    that choice rather than introducing a self/raw-id distinction khi's own
+    production adapter deliberately does not make for this source.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping, Sequence
+
+#: search.messages hits per query when BOID_SIGNAL_CONFIG has no "count"
+#: (matches the migrated khi adapter's own DEFAULT_COUNT).
+DEFAULT_COUNT = 20
+
+#: gateway HTTP call timeout (seconds). This connector is fired on a
+#: schedule (every: in the metaproject's signals.sources[]), so one call
+#: hanging past the trigger interval is worse than a clear failure.
+DEFAULT_TIMEOUT_SECONDS = 30
+
+GetFn = Callable[[str, Mapping[str, str]], Any]
+
+
+class SlackAPIError(Exception):
+    """Slack Web API answered HTTP 200 with `{"ok": false, "error": "..."}`.
+
+    Slack reports auth failures, missing scopes, and most other method-level
+    errors this way — NOT via HTTP status (see
+    skills/slack-api/references/pagination-and-errors.md). Raising here
+    (rather than treating an ok:false response as "zero results") matters:
+    swallowing it would silently advance nothing, but a caller who treats an
+    exception-free empty return as "no new mentions" would let the cursor's
+    caller believe this poll cycle was clean when it was actually a
+    complete auth failure — the connector process contract says explicitly
+    not to swallow failures (§5.3 "終了: 成功 0 / 失敗非ゼロ (握り潰さない)").
+    """
+
+    def __init__(self, path: str, error: str) -> None:
+        self.path = path
+        self.error = error
+        super().__init__(f"slack {path} -> ok=false: {error}")
+
+
+class GatewayError(Exception):
+    """The boid API gateway call itself failed (non-2xx HTTP)."""
+
+    def __init__(self, path: str, status: int, body: str) -> None:
+        self.path = path
+        self.status = status
+        self.body = body
+        snippet = body if len(body) <= 500 else body[:500] + "…"
+        super().__init__(f"boid API gateway: {path} -> HTTP {status}: {snippet}")
+
+
+class CursorError(Exception):
+    """`boid signal cursor` exited non-zero."""
+
+
+class IngestError(Exception):
+    """`boid signal ingest` exited non-zero."""
+
+
+# ---------------------------------------------------------------------------
+# boid API gateway call (stdlib only — no external HTTP library)
+# ---------------------------------------------------------------------------
+
+
+def _ssl_context() -> ssl.SSLContext | None:
+    cafile = os.environ.get("BOID_API_CA_FILE")
+    if not cafile:
+        return None
+    return ssl.create_default_context(cafile=cafile)
+
+
+def gateway_get(service: str, path: str, params: Mapping[str, str] | None = None) -> Any:
+    """One GET through the boid API gateway: `$BOID_API_BASE/<service><path>`.
+
+    No Authorization header is assembled here — the gateway injects the
+    service's bound credential itself (docs/plans/api-gateway.md); a
+    connector holds no Slack token of its own at any point.
+    """
+    base = os.environ.get("BOID_API_BASE")
+    if not base:
+        raise GatewayError(path, 0, "BOID_API_BASE is not set")
+    url = f"{base.rstrip('/')}/{service}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(
+            req, context=_ssl_context(), timeout=DEFAULT_TIMEOUT_SECONDS
+        ) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise GatewayError(path, e.code, body) from e
+    except urllib.error.URLError as e:
+        raise GatewayError(path, 0, str(e.reason)) from e
+
+    if not raw:
+        return {}
+    text = raw.decode("utf-8")
+    if not text.strip():
+        return {}
+    return json.loads(text)
+
+
+def _check_ok(path: str, resp: Any) -> Mapping[str, Any]:
+    if isinstance(resp, dict) and resp.get("ok") is False:
+        raise SlackAPIError(path, str(resp.get("error", "unknown")))
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# thread_ts recovery (2026-08-21 production observation, ported verbatim
+# from khi/adapters/slack.py)
+# ---------------------------------------------------------------------------
+
+
+def _parse_ts(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _thread_ts_from_permalink(permalink: str | None) -> str | None:
+    """Only a REPLY's permalink carries `?thread_ts=<parent ts>` — a thread
+    parent or a standalone message's permalink has no such query param, so
+    callers must still fall back to the message's own `ts` after this."""
+    if not permalink:
+        return None
+    try:
+        query = urllib.parse.urlsplit(permalink).query
+    except ValueError:
+        return None
+    values = urllib.parse.parse_qs(query).get("thread_ts")
+    return values[0] if values else None
+
+
+def _resolve_thread_ts(match: Mapping[str, Any]) -> str:
+    """3-step fallback: match's own `thread_ts` field (present if Slack ever
+    starts sending it directly), then the permalink's query parameter (the
+    path that is actually exercised in production as of 2026-08-21), then
+    the message's own `ts` (a thread parent or standalone message IS its own
+    thread)."""
+    field = match.get("thread_ts")
+    if field:
+        return str(field)
+    from_link = _thread_ts_from_permalink(match.get("permalink"))
+    if from_link:
+        return from_link
+    return str(match.get("ts", ""))
+
+
+# ---------------------------------------------------------------------------
+# search.messages -> new-mention rows
+# ---------------------------------------------------------------------------
+
+
+def fetch_my_user_id(get: GetFn) -> str:
+    resp = _check_ok("/auth.test", get("/auth.test", {}))
+    return str(resp.get("user_id") or "")
+
+
+def _occurred_at(ts_value: float) -> str:
+    """RFC3339, UTC, `Z` suffix — what `boid signal ingest` requires
+    (`occurred_at` is parsed server-side with Go's time.Parse(time.RFC3339,
+    ...), which accepts an arbitrary-precision fractional-second component
+    as long as it is introduced by '.', so Slack's native microsecond ts
+    round-trips exactly)."""
+    return datetime.fromtimestamp(ts_value, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def collect_new_mentions(
+    get: GetFn,
+    *,
+    my_user_id: str,
+    cursor_threshold: float | None,
+    count: int = DEFAULT_COUNT,
+) -> list[dict[str, str]]:
+    """Returns envelope rows (§5.2 shape, `source` omitted — the daemon
+    synthesizes it from BOID_SIGNAL_SERVICE/BOID_SIGNAL_CONNECTOR) for
+    mentions strictly newer than cursor_threshold, oldest first.
+
+    `cursor_threshold` is a Unix timestamp (or None for "read from the
+    beginning") — the exclusive lower bound. This function enforces
+    `occurred_at > cursor` itself rather than trusting search.messages'
+    ordering alone (docs/plans/signal-ingest-detailed-design.md §5.3's
+    "栞の契約...外部検索の精度に任せず、取得後に occurred_at <= cursor を
+    自分で落とす") — the two queries below ask Slack for a recency-sorted
+    window and this function is what actually enforces the boundary.
+    """
+    seen: set[tuple[str, str]] = set()
+    rows: list[dict[str, str]] = []
+
+    for query in (f"<@{my_user_id}>", f"to:<@{my_user_id}>"):
+        resp = _check_ok(
+            "/search.messages",
+            get(
+                "/search.messages",
+                {
+                    "query": query,
+                    "sort": "timestamp",
+                    "sort_dir": "desc",
+                    "count": str(count),
+                },
+            ),
+        )
+        matches = ((resp.get("messages") or {}).get("matches")) or ()
+        for m in matches:
+            ts_value = _parse_ts(m.get("ts"))
+            if ts_value is None:
+                continue
+            if cursor_threshold is not None and ts_value <= cursor_threshold:
+                # Descending sort: everything after this in the SAME query's
+                # matches is older still, so it is safe to stop consuming
+                # this query's results here (khi precedent — see
+                # test_it_never_expands_the_thread and friends in
+                # slack/tests/test_mentions.py).
+                break
+
+            channel_id = (m.get("channel") or {}).get("id", "")
+            ts = str(m.get("ts", ""))
+            key = (channel_id, ts)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            thread_ts = _resolve_thread_ts(m)
+            row: dict[str, str] = {
+                "id": f"slack:{channel_id}:{ts}",
+                "occurred_at": _occurred_at(ts_value),
+                "identity": f"slack-thread:{thread_ts}",
+            }
+            permalink = m.get("permalink")
+            if permalink:
+                row["url"] = str(permalink)
+            rows.append(row)
+
+    rows.sort(key=lambda r: r["occurred_at"])
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# boid signal cursor / boid signal ingest (subprocess — the shim binary on
+# PATH inside every job sandbox, not something this connector implements)
+# ---------------------------------------------------------------------------
+
+
+_RFC3339_RE = re.compile(
+    r"^(?P<base>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<frac>\d+))?"
+    r"(?P<tz>Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _parse_rfc3339(value: str) -> datetime:
+    """Parses what `boid signal cursor` returns. boid formats stored
+    cursors with a fixed 9-digit fractional-second field
+    (internal/orchestrator/signal_store.go's signalTimeLayout) — Python's
+    stdlib datetime.fromisoformat only accepts a 3- or 6-digit fractional
+    component on the Python versions a project sandbox image may
+    realistically ship (fromisoformat's wider ISO-8601 support, including
+    arbitrary-precision fractions, is a Python 3.11+ addition) — so the
+    fractional component is parsed out with a regex and re-padded/truncated
+    to exactly 6 digits (microseconds) rather than handed to
+    fromisoformat() untouched."""
+    m = _RFC3339_RE.match(value.strip())
+    if not m:
+        raise ValueError(f"boid signal cursor: unparseable RFC3339 value {value!r}")
+    text = m.group("base")
+    frac = m.group("frac")
+    if frac:
+        text += "." + frac[:6].ljust(6, "0")
+    tz = m.group("tz")
+    text += "+00:00" if tz == "Z" else tz
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def get_cursor(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> float | None:
+    """Returns the stored cursor as a Unix timestamp, or None if this
+    (service, connector) has never ingested before (§2: "無ければ空文字 (=
+    最初から)")."""
+    proc = run(["boid", "signal", "cursor"], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise CursorError(f"boid signal cursor: exit {proc.returncode}: {proc.stderr.strip()}")
+    payload = json.loads(proc.stdout)
+    cursor = payload.get("cursor", "")
+    if not cursor:
+        return None
+    return _parse_rfc3339(cursor).timestamp()
+
+
+def ingest_rows(
+    rows: Sequence[Mapping[str, str]],
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run,
+) -> None:
+    """Writes rows as JSONL to `boid signal ingest`'s stdin in a single
+    call. §5.3 allows (and for a paging connector, requires) multiple ingest
+    calls, but this connector's two search.messages queries are both
+    unpaginated single requests already merged/sorted in memory by
+    collect_new_mentions, so one call covers a whole run — there is no
+    "ingest one page, crash, lose the next page" hazard to design around
+    here (see collect_new_mentions' own docstring)."""
+    if not rows:
+        return
+    body = "\n".join(json.dumps(dict(row), ensure_ascii=False) for row in rows) + "\n"
+    proc = run(
+        ["boid", "signal", "ingest"],
+        input=body,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise IngestError(f"boid signal ingest: exit {proc.returncode}: {proc.stderr.strip()}")
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+
+def _load_config() -> dict[str, Any]:
+    raw = os.environ.get("BOID_SIGNAL_CONFIG", "").strip()
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def main() -> int:
+    service = os.environ.get("BOID_SIGNAL_SERVICE")
+    if not service:
+        print("mentions: BOID_SIGNAL_SERVICE is not set (must run as a connector job)", file=sys.stderr)
+        return 1
+
+    config = _load_config()
+    count = config.get("count") or DEFAULT_COUNT
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        count = DEFAULT_COUNT
+
+    def get(path: str, params: Mapping[str, str]) -> Any:
+        return gateway_get(service, path, params)
+
+    cursor_threshold = get_cursor()
+    my_user_id = fetch_my_user_id(get)
+    rows = collect_new_mentions(get, my_user_id=my_user_id, cursor_threshold=cursor_threshold, count=count)
+    ingest_rows(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

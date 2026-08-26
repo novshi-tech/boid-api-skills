@@ -1,0 +1,45 @@
+apiVersion: boid.dev/v1
+kind: IntegrationPack
+metadata:
+  name: slack
+  version: 1.0.0
+
+serviceProfiles:
+  - name: slack
+    endpoint:
+      # Slack Web API has a single fixed base URL (https://slack.com/api) —
+      # there is no per-tenant hostname to configure, so instances of this
+      # profile must not supply one (docs/plans/signal-driven-review.md
+      # §7.1's worked example for "endpoint 固定のサービス (Slack)").
+      configurable: false
+    credentials:
+      # Slack Web API auth is `Authorization: Bearer <token>` — either a bot
+      # token (xoxb-...) or a user token (xoxp-...). search.messages (used
+      # by the mentions connector) requires a USER token with the
+      # search:read scope; Slack does not expose search to bot tokens at
+      # all. See skills/slack-api/references/authentication.md.
+      - name: token
+        injection: bearer
+
+connectors:
+  - name: mentions
+    executable: connectors/mentions
+    serviceProfile: slack
+    configSchema:
+      type: object
+      properties:
+        # Max hits requested per search.messages query (one call for
+        # "<@my_user_id>", one for "to:<@my_user_id>"). Optional — defaults
+        # to 20 inside the connector when omitted, matching the migrated
+        # khi-task-collector adapter's own default. search.messages sorts
+        # descending by timestamp and the connector stops consuming a page
+        # once it crosses the cursor, so raising this only matters for a
+        # workspace with an unusually bursty mention volume within one
+        # trigger interval.
+        count:
+          type: number
+
+skills:
+  - name: slack-api
+    path: skills/slack-api
+    requiresServiceProfile: slack
