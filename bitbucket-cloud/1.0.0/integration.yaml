@@ -20,14 +20,24 @@ serviceProfiles:
     endpoint:
       configurable: true
     credentials:
-      # Bitbucket Cloud's documented Basic-auth-with-API-token convention:
-      # HTTP Basic with the fixed username "x-bitbucket-api-token-auth" and
-      # the API token as the password. See skills/bitbucket-api/references/
+      # Bitbucket Cloud speaks TWO Basic-auth conventions, depending on which
+      # kind of token the operator created:
+      #   - an Atlassian *account* API token (id.atlassian.com) authenticates
+      #     as `<atlassian-registered-email>:<token>`; and
+      #   - a Bitbucket *scoped* API token authenticates as the fixed
+      #     username `x-bitbucket-api-token-auth`.
+      # This slot originally baked in the fixed scoped-token username, which
+      # made account API tokens unusable: the first real service instance
+      # (2026-08-27) failed every request with HTTP 401 `API token must be
+      # used with an atlassian registered email`. Let the instance choose its
+      # username instead (same shape as jira-cloud's slot): an account-token
+      # operator writes their email, a scoped-token operator writes
+      # `x-bitbucket-api-token-auth`. See skills/bitbucket-api/references/
       # authentication.md (this Pack's own reference skill) for the
       # operator-facing writeup this slot mirrors.
       - name: token
         injection: basic
-        username: x-bitbucket-api-token-auth
+        usernameFrom: instance
 
 connectors:
   - name: pr-comments
