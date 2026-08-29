@@ -1,6 +1,6 @@
 # 会計API（Accounting）
 
-すべてのパスは `{BASE_URL}` からの相対パス。boidゲートウェイ経由の場合は `{BASE_URL}` = `$BOID_API_BASE/freee`、直接呼び出しの場合は `{BASE_URL}` = `https://api.freee.co.jp`（詳細は [SKILL.md](../SKILL.md) と [authentication.md](authentication.md) 参照）。会計APIのパスプレフィックスは共通して **`/api/1`**。
+すべてのパスは `{BASE_URL}` からの相対パス。boidゲートウェイ経由の場合は `{BASE_URL}` = `$BOID_API_BASE/freee@<account>`（例: `$BOID_API_BASE/freee@ubs`。`ubs`/`nvt` どちらを使うべきかは [SKILL.md](../SKILL.md) の「アカウントの選び方」参照）、直接呼び出しの場合は `{BASE_URL}` = `https://api.freee.co.jp`（詳細は [SKILL.md](../SKILL.md) と [authentication.md](authentication.md) 参照）。会計APIのパスプレフィックスは共通して **`/api/1`**。
 
 対応範囲は `freee-cli` の `accounting` サブコマンド（`cmd/accounting_*.go`）と同等。GETは基本的に `company_id` をクエリパラメータで渡し、POST/PUT/PATCHは `company_id` をJSONボディに含める（詳細は [authentication.md](authentication.md) の「company_idの扱い」節）。書き込み系のリクエストボディの正確なフィールド一覧は `freee-cli` 側では検証されていない（stdinのJSONをそのまま転送するだけ）ため、フィールド名はfreee公式リファレンス（`https://developer.freee.co.jp/reference/accounting/reference`）で確認すること。本ファイルはエンドポイントの所在とパラメータの「型」を示すことに主眼を置く。
 
@@ -24,7 +24,7 @@ curl --cacert "$BOID_API_CA_FILE" -G \
   --data-urlencode "type=expense" \
   --data-urlencode "start_issue_date=2026-08-01" \
   --data-urlencode "limit=50" \
-  "$BOID_API_BASE/freee/api/1/deals"
+  "$BOID_API_BASE/freee@ubs/api/1/deals"
 ```
 
 作成（`type`/`company_id`/`issue_date`/`due_date`/`partner_id`/`details[]`〔勘定科目・金額・税区分等の明細行〕といった一般的なfreee会計APIの取引スキーマが要求されると想定されるが、正確な必須項目は公式リファレンスで確認すること）:
@@ -32,7 +32,7 @@ curl --cacert "$BOID_API_CA_FILE" -G \
 ```bash
 echo '{"company_id": 123456, "issue_date": "2026-08-05", "type": "expense", "details": [...]}' | \
   curl --cacert "$BOID_API_CA_FILE" -X POST -H "Content-Type: application/json" \
-  --data-binary @- "$BOID_API_BASE/freee/api/1/deals"
+  --data-binary @- "$BOID_API_BASE/freee@ubs/api/1/deals"
 ```
 
 ### 口座明細（wallet_txns、同期された銀行/カード明細）
@@ -231,7 +231,7 @@ curl --cacert "$BOID_API_CA_FILE" -G \
   --data-urlencode "fiscal_year=2026" \
   --data-urlencode "start_month=4" \
   --data-urlencode "end_month=3" \
-  "$BOID_API_BASE/freee/api/1/reports/trial_pl"
+  "$BOID_API_BASE/freee@ubs/api/1/reports/trial_pl"
 ```
 
 ### 仕訳帳ダウンロード（journals、非同期のファイル生成パターン）

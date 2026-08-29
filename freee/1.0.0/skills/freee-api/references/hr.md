@@ -24,7 +24,7 @@ curl --cacert "$BOID_API_CA_FILE" -G \
   --data-urlencode "company_id=123456" \
   --data-urlencode "year=2026" \
   --data-urlencode "month=8" \
-  "$BOID_API_BASE/freee/hr/api/v1/employees"
+  "$BOID_API_BASE/freee@ubs/hr/api/v1/employees"
 ```
 
 ### プロフィールサブリソース（`/employees/{id}/{サブリソース}`）
@@ -48,7 +48,7 @@ GET系はいずれも `company_id`（クエリ）に加え `year`/`month`（該�
 curl --cacert "$BOID_API_CA_FILE" -G \
   --data-urlencode "company_id=123456" \
   --data-urlencode "year=2026" --data-urlencode "month=8" \
-  "$BOID_API_BASE/freee/hr/api/v1/employees/{employee_id}/bank_account_rule"
+  "$BOID_API_BASE/freee@ubs/hr/api/v1/employees/{employee_id}/bank_account_rule"
 ```
 
 ## 勤怠（work_records / time_clocks / work_record_summaries）
@@ -156,12 +156,12 @@ POST   {prefix}/{id}/actions        # 承認/却下アクション（bodyでacti
 curl --cacert "$BOID_API_CA_FILE" -G \
   --data-urlencode "company_id=123456" \
   --data-urlencode "status=in_progress" \
-  "$BOID_API_BASE/freee/hr/api/v1/approval_requests/paid_holidays"
+  "$BOID_API_BASE/freee@ubs/hr/api/v1/approval_requests/paid_holidays"
 
 # 承認アクションの実行
 echo '{"action": "approve"}' | curl --cacert "$BOID_API_CA_FILE" -X POST \
   -H "Content-Type: application/json" --data-binary @- \
-  "$BOID_API_BASE/freee/hr/api/v1/approval_requests/paid_holidays/{id}/actions"
+  "$BOID_API_BASE/freee@ubs/hr/api/v1/approval_requests/paid_holidays/{id}/actions"
 ```
 
 （`action` フィールドの正確な値〔`approve`/`reject`等〕はfreee公式リファレンスで確認すること。`freee-cli` はbodyを検証せずそのまま転送するだけ）

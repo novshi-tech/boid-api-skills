@@ -1,0 +1,53 @@
+apiVersion: boid.dev/v1
+kind: IntegrationPack
+metadata:
+  name: freee
+  version: 1.0.0
+
+serviceProfiles:
+  - name: freee
+    endpoint:
+      configurable: true
+    credentials:
+      # Declared for completeness, and NOT how the dogfood instance is wired.
+      #
+      # freee is OAuth2 (authorization-code flow, OOB redirect since freee
+      # doesn't support PKCE, rotating refresh token), and a Pack credential
+      # slot can only express a STATIC secret (bearer/basic/header/query —
+      # see internal/integrationpack/manifest.go's CredentialInjection).
+      # There is no slot shape that could carry an access token that expires
+      # in a few hours and a refresh token the gateway rotates on its own —
+      # same limitation the gmail/msgraph Packs' profiles hit, and the same
+      # reason: v0 has no "injection: oauth2, provider X" slot.
+      #
+      # That does not block loading this Pack: boid never checks a
+      # connector's (or, for a Pack with no connector, nothing at all)
+      # declared serviceProfile against the instance it is pointed at, and
+      # this Pack has no connector to begin with — the profile exists solely
+      # so `requiresServiceProfile: freee` below has something to name. A
+      # workspace wiring freee up for real points its `services.freee`
+      # entry at an existing oauth2 service instance
+      # (`auth: {kind: oauth2, provider: freee}` in config.yaml, with
+      # `require_account: true` since freee is used under two credential
+      # accounts — see the freee-api skill's authentication reference) — it
+      # is never constructed from this profile via a `uses:` entry.
+      #
+      # Keep this slot until Pack profiles can say "oauth2, provider X";
+      # deleting it would make the Pack unloadable, and inventing a fake
+      # static slot the operator is expected not to use would be worse.
+      - name: token
+        injection: bearer
+
+# No connectors: block. freee is not a source boid ingests Signals from —
+# this Pack exists only to carry the freee-api reference skill (and the
+# service profile it requires) into the image, not to add a source to the
+# signal inbox. internal/integrationpack/manifest.go has no minimum-1
+# requirement on Connectors (the field is optional, `omitempty`), and
+# packconformance's checks (connector_executable, connector_launchable) both
+# simply iterate zero connectors and pass trivially — there is nothing here
+# for either to check.
+
+skills:
+  - name: freee-api
+    path: skills/freee-api
+    requiresServiceProfile: freee

@@ -19,7 +19,7 @@ GET /api/1/deals?company_id=123456&offset=50&limit=50
 ```python
 import os
 
-base = f"{os.environ['BOID_API_BASE']}/freee"
+base = f"{os.environ['BOID_API_BASE']}/freee@ubs"  # ubs/nvtどちらを使うかはSKILL.mdの「アカウントの選び方」参照
 offset, limit = 0, 100
 all_deals = []
 while True:
@@ -87,14 +87,19 @@ type APIError struct {
 
 | ステータス | ボディの典型例 | 原因 |
 |---|---|---|
+| 400 | `bad request: service freee requires a credential-account qualifier — ...` | account修飾が必須なservice（`require_account: true`、freeeを含む）に、accountを付けずにアクセスした。`<service>` を `<service>@<account>`（例: `freee@ubs`）に直す必要がある |
+| 400 | `bad request: invalid credential-account "..."` | account名がルール（英数字・`-`・`_` のみ、1〜64文字）に違反している（記号を含む、空文字、65文字以上など） |
 | 404 | `404 page not found` | リクエストパスが `/api/<job-token>/<service>/<tail>` の形に合っていない |
 | 401 | `unauthorized: invalid or expired job token` | job token自体が不明・失効（ジョブ終了後は無効化される） |
-| 403 | `forbidden: service not permitted for this job token` | `<service>` を `config.yaml` の `services:` に定義しただけでは不十分。ジョブ/ワークスペース側でそのサービスを明示的に有効化していないと出る |
+| 403 | `forbidden: service not permitted for this job token` | `<service>` を `config.yaml` の `services:` に定義しただけでは不十分。ジョブ/ワークスペース側でそのサービスを明示的に有効化していないと出る（判定はaccountを除いた基底名で行われる — `freee@ubs` で呼んでも、ワークスペースで有効化するのは `freee` 単体でよく、account単位で個別に有効化する必要はない） |
 | 403 | `forbidden: read-only job token may only use GET/HEAD` | read-only jobからPOST/PUT/PATCH/DELETEなど書き込み系メソッドを呼んだ |
 | 502 | `bad gateway: service X is not configured` | `<service>` という名前が `config.yaml` の `services:` に存在しない（サービス名の誤り） |
-| 502 | `bad gateway: api gateway credential resolution failed...` | OAuthトークンの期限切れ・リフレッシュ失敗など、資格情報解決自体が失敗（fail-closed）。freeeのようにrefresh_tokenがローテーションするプロバイダでは、古いrefresh_tokenが既に失効している場合にもこのエラーになりうる（詳細は [authentication.md](authentication.md)） |
+| 502 | `bad gateway: api gateway credential resolution failed for service freee@typo: ...` | **account修飾の書き方自体は正しいが、指定したaccount名のcredentialが実際には存在しない**（例: `freee@typo` のように存在しないaccount名を書いた、または実在するaccount名〔`ubs`/`nvt`〕だがまだそのaccountでの認証フローが未実行）。**無修飾のcredentialにも、他のaccountのcredentialにもフォールバックしない** — accountを書き間違えた場合は常にこのエラーになる |
+| 502 | `bad gateway: api gateway credential resolution failed...` | 上記以外の理由でOAuthトークンの期限切れ・リフレッシュ失敗など、資格情報解決自体が失敗（fail-closed）。freeeのようにrefresh_tokenがローテーションするプロバイダでは、古いrefresh_tokenが既に失効している場合にもこのエラーになりうる（詳細は [authentication.md](authentication.md)） |
 | 502 | `bad gateway: api gateway credential resolution failed for service <svc>: apigateway: oauth2 provider "<p>" is not configured (oauth_providers: in config.yaml)` | `services.<name>.auth.provider` が指す `oauth_providers` エントリが存在しない（この文言は上の行の「資格情報解決失敗」エラーに内包される形で返るため、`oauth2 provider "..." is not configured` の部分文字列だけで判定すること。プレフィックスが `bad gateway: apigateway: oauth2 provider...` 単体で返るわけではない） |
 | 503 | `service unavailable: api gateway has no secret resolver configured` | boidデーモン自体にシークレットストアが配線されていない（運用者側の設定不足） |
+
+**400と502の違いに注意:** 400は「account修飾を書いていない、または書き方がルールに反する」という**リクエストの形そのものの問題**で、パスを書き直せば直る。502は「account修飾の書き方は正しいが、そのaccount名のcredentialが実際には存在しない」という**credentialの有無の問題**で、そのaccountの認可フローを済ませない限り解決しない。正しく存在するaccount（`freee@ubs`/`freee@nvt`）を指定したリクエストが400になることはない — 400が出た場合はaccount修飾自体を書き忘れているか、account名の文字種・長さがルール違反であることを疑うこと。
 
 401/403がfreee標準のJSON（`message`/`errors` を含む）で返ってきた場合はfreee側の権限・認可問題、プレーンテキストで返ってきた場合は上表のゲートウェイ側の問題として切り分けること。
 
