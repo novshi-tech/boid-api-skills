@@ -1,0 +1,57 @@
+apiVersion: boid.dev/v1
+kind: IntegrationPack
+metadata:
+  name: gmail
+  version: 1.0.0
+
+serviceProfiles:
+  - name: gmail
+    endpoint:
+      configurable: true
+    credentials:
+      # Declared for completeness, and NOT how the dogfood instance is wired.
+      #
+      # Gmail is OAuth2 with a refresh token, and a Pack credential slot can
+      # only express a STATIC secret (bearer/basic/header/query — see
+      # internal/integrationpack/manifest.go's CredentialInjection). A
+      # `uses:` service entry built from this profile would therefore have to
+      # carry a hand-pasted access token that expires in an hour.
+      #
+      # That does not block the connector: boid never checks a connector's
+      # declared serviceProfile against the instance it is pointed at
+      # (resolveConnectorExec just scopes the job's gateway token to
+      # `signals.sources[].service`). So a workspace points this connector at
+      # its EXISTING oauth2 service instance — `gmail-api`, with
+      # `auth: {kind: oauth2, provider: google}` in config.yaml — and the
+      # gateway refreshes on its own.
+      #
+      # Keep this slot until Pack profiles can say "oauth2, provider X";
+      # deleting it would make the Pack unloadable, and inventing a fake
+      # static slot the operator is expected not to use would be worse.
+      - name: token
+        injection: bearer
+
+connectors:
+  - name: unread-to-me
+    executable: connectors/unread-to-me
+    serviceProfile: gmail
+    configSchema:
+      type: object
+      properties:
+        # Extra Gmail search terms ANDed onto the base query. The base is
+        # not overridable: `is:unread to:me` IS what this connector is, and
+        # a workspace that wants something else wants a different connector.
+        extra_query:
+          type: string
+        # Search page size (Gmail caps this at 500; the per-message metadata
+        # fetch after it is what actually costs, so keep it modest).
+        max_results:
+          type: number
+        # How far back the very first, cursor-less run looks.
+        initial_window_days:
+          type: number
+
+skills:
+  - name: gmail-api
+    path: skills/gmail-api
+    requiresServiceProfile: gmail

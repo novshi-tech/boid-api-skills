@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""msgraph Integration Pack — ``unread-to-me`` connector.
+
+Detects unread mail addressed directly to the gateway's authenticated
+account and hands it to boid as Signals (envelope v0). The Microsoft
+Graph half of the gmail Pack's connector of the same name — read that one
+too if you are comparing, because the ONE structural difference between
+them is worth understanding.
+
+## Graph cannot express "I am in To", so this filters after fetching
+
+Gmail says ``to:me`` in its query language and the server does the work.
+Graph's ``$filter`` has no operator over ``toRecipients`` that survives the
+mail endpoint's restrictions, so this connector asks for unread mail since
+the bookmark and then drops anything where the account's own address is not
+in ``toRecipients``.
+
+That ordering matters for the page size: the server-side page is a page of
+UNREAD mail, and the To filter runs after, so a mailbox with a lot of cc'd
+noise yields fewer rows per page than ``top`` suggests. That is fine — the
+alternative (widening the scope to whatever the server can filter) is the
+thing this connector exists to avoid.
+
+**Why so narrow.** A mailbox is the lowest signal-to-noise source a
+metaproject will ever read. "Unread AND addressed to me" is the cheapest
+filter that still means something: a person wrote to you and you have not
+dealt with it. Anything wider turns the card queue into a second inbox,
+which makes the whole system worthless.
+
+## Identity is the CONVERSATION, not the message
+
+A reply to a mail you already have a card for is the same piece of work, so
+identity keys on ``conversationId``. Keying on the message id would open a
+new card per reply.
+
+Pack contract (``signal-ingest-detailed-design.md`` §5.3/§7.2): input from
+``BOID_SIGNAL_*`` env, bookmark via ``boid signal cursor``, fetch only
+through ``$BOID_API_BASE``, output JSONL to ``boid signal ingest``
+oldest-first, non-zero exit on any failure.
+"""
+from __future__ import annotations
+
+import json
+import os
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Sequence
+
+DEFAULT_TIMEOUT_SECONDS = 30
+
+#: Safety cap on ``@odata.nextLink`` following. Reaching it raises rather
+#: than truncating — a dropped page shows up only as "signals that never
+#: arrive", which nothing detects from outside.
+MAX_PAGES = 20
+
+#: Server-side page size. The To filter runs AFTER this, so the number of
+#: rows produced per page is at most this, usually fewer.
+DEFAULT_TOP = 50
+
+#: How far back the very first (cursor-less) run looks. Without a bound the
+#: first run either pulls an entire mailbox or exceeds MAX_PAGES and raises
+#: on every run forever — a raise never reaches ingest, and the cursor only
+#: advances inside ingest, so the next run repeats the same query.
+DEFAULT_INITIAL_WINDOW_DAYS = 7
+
+INGEST_CHUNK_SIZE = 200
+
+DEFAULT_FOLDER = "inbox"
+
+#: Asked for by name so the response carries the envelope fields and **not
+#: the body** — a Signal says something happened, it does not carry content.
+SELECT_FIELDS = "id,conversationId,subject,receivedDateTime,from,toRecipients,webLink,isRead"
+
+
+class GatewayError(Exception):
+    def __init__(self, service: str, path: str, status: int, body: str) -> None:
+        self.service = service
+        self.path = path
+        self.status = status
+        self.body = body
+        snippet = body if len(body) <= 500 else body[:500] + "…"
+        super().__init__(f"boid API gateway: {service}{path} -> HTTP {status}: {snippet}")
+
+
+class PaginationExhaustedError(Exception):
+    """Message-list pagination hit MAX_PAGES before running out of results."""
+
+
+def _base_url() -> str:
+    base = os.environ.get("BOID_API_BASE")
+    if not base:
+        raise GatewayError("", "", 0, "BOID_API_BASE is not set")
+    return base.rstrip("/")
+
+
+def _ssl_context() -> "ssl.SSLContext | None":
+    cafile = os.environ.get("BOID_API_CA_FILE")
+    if not cafile:
+        return None
+    return ssl.create_default_context(cafile=cafile)
+
+
+def gateway_get(
+    service: str,
+    path: str,
+    params: "Mapping[str, str] | None" = None,
+    *,
+    urlopen: Any = urllib.request.urlopen,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Any:
+    """GET one path through the boid API gateway.
+
+    No ``Authorization`` header is built here — the gateway injects the real
+    credential (an OAuth2 one it refreshes itself) and strips anything the
+    client sent.
+    """
+    url = f"{_base_url()}/{service}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url)
+    try:
+        with urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+            body = response.read().decode("utf-8")
+            status = getattr(response, "status", 200)
+    except urllib.error.HTTPError as e:
+        raise GatewayError(service, path, e.code, e.read().decode("utf-8", "replace")) from e
+    except urllib.error.URLError as e:
+        raise GatewayError(service, path, 0, str(e.reason)) from e
+    if status < 200 or status >= 300:
+        raise GatewayError(service, path, status, body)
+    if not body.strip():
+        return {}
+    return json.loads(body)
+
+
+def _parse_time(value: object) -> "datetime | None":
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def parse_cursor(value: str) -> "datetime | None":
+    return _parse_time(value)
+
+
+def _to_rfc3339(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def own_address(service: str, *, get: Any = gateway_get) -> str:
+    """The authenticated account's own address, lower-cased.
+
+    Needed because the To filter runs client-side (module docstring). An
+    empty answer is a hard failure rather than a permissive fallback: with
+    no address to compare against, "addressed to me" would silently become
+    "any unread mail", which is precisely the scope this connector refuses.
+    """
+    me = get(service, "/me", {"$select": "mail,userPrincipalName"})
+    if not isinstance(me, Mapping):
+        raise GatewayError(service, "/me", 0, f"expected a JSON object, got {type(me).__name__}")
+    for key in ("mail", "userPrincipalName"):
+        value = me.get(key)
+        if isinstance(value, str) and value:
+            return value.lower()
+    raise GatewayError(service, "/me", 0, "the account has neither mail nor userPrincipalName")
+
+
+def addressed_to(message: Mapping[str, Any], me: str) -> bool:
+    """Whether ``me`` appears in the message's ``toRecipients``.
+
+    cc and bcc deliberately do not count — being copied is being informed,
+    not being asked. That distinction is the entire filter.
+    """
+    for recipient in message.get("toRecipients") or ():
+        if not isinstance(recipient, Mapping):
+            continue
+        address = (recipient.get("emailAddress") or {}) if isinstance(recipient.get("emailAddress"), Mapping) else {}
+        value = address.get("address")
+        if isinstance(value, str) and value.lower() == me:
+            return True
+    return False
+
+
+def _list_messages(
+    service: str,
+    *,
+    folder: str,
+    since: str,
+    top: int,
+    get: Any = gateway_get,
+) -> list[dict]:
+    """Page through one folder's unread messages received after ``since``.
+
+    ``$orderby`` matches the ``$filter`` field, which Graph requires; asking
+    ascending also keeps the cursor advancing monotonically if a run is cut
+    short partway through ingest.
+    """
+    params = {
+        "$filter": f"isRead eq false and receivedDateTime gt {since}",
+        "$orderby": "receivedDateTime asc",
+        "$select": SELECT_FIELDS,
+        "$top": str(top),
+    }
+    items: list[dict] = []
+    skip = 0
+    for _ in range(MAX_PAGES):
+        page_params = dict(params)
+        if skip:
+            page_params["$skip"] = str(skip)
+        payload = get(service, f"/me/mailFolders/{folder}/messages", page_params)
+        if not isinstance(payload, Mapping):
+            raise GatewayError(service, "/me/mailFolders", 0, f"expected a JSON object, got {type(payload).__name__}")
+        batch = [x for x in (payload.get("value") or ()) if isinstance(x, Mapping)]
+        items.extend(batch)
+        if not payload.get("@odata.nextLink") or not batch:
+            return items
+        skip += len(batch)
+    raise PaginationExhaustedError(
+        f"message list pagination exceeded {MAX_PAGES} pages — refusing to truncate silently"
+    )
+
+
+def collect_envelopes(
+    *,
+    service: str,
+    cursor_at: "datetime | None",
+    now: datetime,
+    folder: str = DEFAULT_FOLDER,
+    top: int = DEFAULT_TOP,
+    initial_window_days: float = DEFAULT_INITIAL_WINDOW_DAYS,
+    get: Any = gateway_get,
+) -> list[dict]:
+    """Fetch, filter, and shape one run's Signal rows (envelope v0).
+
+    Two filters run here, for different reasons:
+
+    - **To**, because Graph cannot express it server-side (module docstring).
+    - **the cursor**, because ``gt`` on ``receivedDateTime`` is only as
+      precise as Graph's own rounding, and a boundary that ever behaved
+      inclusively would re-emit the newest message on every run — and while
+      it stayed the newest, the bookmark could never move past it.
+
+    Returned oldest-first (§5.3).
+    """
+    floor = cursor_at if cursor_at is not None else now - timedelta(days=initial_window_days)
+    me = own_address(service, get=get)
+    messages = _list_messages(service, folder=folder, since=_to_rfc3339(floor), top=top, get=get)
+
+    rows: list[dict] = []
+    skipped_not_to_me = skipped_unreadable = skipped_before_cursor = 0
+    for message in messages:
+        conversation = message.get("conversationId")
+        message_id = message.get("id")
+        at = _parse_time(message.get("receivedDateTime"))
+        if not isinstance(message_id, str) or not message_id or not isinstance(conversation, str) or not conversation or at is None:
+            skipped_unreadable += 1
+            continue
+        if cursor_at is not None and at <= cursor_at:
+            skipped_before_cursor += 1
+            continue
+        if not addressed_to(message, me):
+            skipped_not_to_me += 1
+            continue
+        occurred_at = _to_rfc3339(at)
+        row = {
+            "id": message_id,
+            "occurred_at": occurred_at,
+            "identity": f"msgraph-mail:{conversation}",
+        }
+        link = message.get("webLink")
+        if isinstance(link, str) and link:
+            row["url"] = link
+        sender = message.get("from")
+        address = ((sender or {}).get("emailAddress") or {}) if isinstance(sender, Mapping) else {}
+        value = address.get("address") if isinstance(address, Mapping) else None
+        if isinstance(value, str) and value:
+            # The self-authored screen reads this: mail you sent yourself
+            # that somehow shows unread is not worth a card.
+            row["author"] = value
+        subject = message.get("subject")
+        if isinstance(subject, str) and subject:
+            row["title"] = subject
+        rows.append(row)
+
+    rows.sort(key=lambda r: (r["occurred_at"], r["id"]))
+    if skipped_not_to_me or skipped_unreadable or skipped_before_cursor:
+        # Not a failure — cc'd mail is routine, and that count is the one
+        # number that says whether this filter is doing anything. Reported so
+        # a systemic cause is visible somewhere instead of showing up only as
+        # "exits 0, nothing ever arrives".
+        print(
+            f"unread-to-me: dropped {skipped_not_to_me + skipped_unreadable + skipped_before_cursor} message(s) "
+            f"(not_to_me={skipped_not_to_me} unreadable={skipped_unreadable} "
+            f"before_cursor={skipped_before_cursor})",
+            file=sys.stderr,
+        )
+    return rows
+
+
+def get_cursor(*, run: Any = subprocess.run) -> str:
+    proc = run(["boid", "signal", "cursor"], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"boid signal cursor: {proc.stderr.strip()}")
+    return str(json.loads(proc.stdout).get("cursor") or "")
+
+
+def ingest_signals(rows: Sequence[Mapping[str, Any]], *, run: Any = subprocess.run, chunk_size: int = INGEST_CHUNK_SIZE) -> None:
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        payload = "\n".join(json.dumps(dict(row), ensure_ascii=False) for row in chunk) + "\n"
+        proc = run(["boid", "signal", "ingest"], input=payload, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"boid signal ingest: {proc.stderr.strip()}")
+
+
+def main() -> int:
+    service = os.environ.get("BOID_SIGNAL_SERVICE") or ""
+    if not service:
+        print("unread-to-me: BOID_SIGNAL_SERVICE is not set", file=sys.stderr)
+        return 1
+    try:
+        config = json.loads(os.environ.get("BOID_SIGNAL_CONFIG") or "{}")
+    except ValueError as e:
+        print(f"unread-to-me: BOID_SIGNAL_CONFIG is not valid JSON: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(config, dict):
+        print("unread-to-me: BOID_SIGNAL_CONFIG must be a JSON object", file=sys.stderr)
+        return 1
+
+    try:
+        rows = collect_envelopes(
+            service=service,
+            cursor_at=parse_cursor(get_cursor(run=subprocess.run)),
+            now=datetime.now(timezone.utc),
+            folder=str(config.get("folder") or DEFAULT_FOLDER),
+            top=int(config.get("top") or DEFAULT_TOP),
+            initial_window_days=float(config.get("initial_window_days") or DEFAULT_INITIAL_WINDOW_DAYS),
+            get=gateway_get,
+        )
+        if rows:
+            ingest_signals(rows, run=subprocess.run)
+    except Exception as e:
+        print(f"unread-to-me: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""gmail Integration Pack — ``unread-to-me`` connector.
+
+Detects unread mail addressed directly to the gateway's authenticated
+account and hands it to boid as Signals (envelope v0).
+
+**The narrow scope is the point.** A mailbox is the lowest signal-to-noise
+source a metaproject will ever read: newsletters, CI notifications, and
+every list the account is on all land in the same place. "Unread AND I am
+in To" is the cheapest filter that still means something — it says a person
+addressed you and you have not dealt with it yet. Everything wider turns
+the card queue into a second inbox, which is the one outcome that makes the
+whole system worthless.
+
+Gmail can express the whole filter server-side (``is:unread to:me``), so
+unlike the msgraph sibling there is no post-filter pass here — a difference
+worth knowing if you are comparing the two.
+
+## Two calls per message, and why
+
+``users.messages.list`` returns ids only. The connector then fetches each
+message with ``format=metadata`` and an explicit header allowlist, which
+returns the envelope fields and **not the body**. That is deliberate: a
+Signal carries "something happened here", never content — the judgment
+reads the thread itself when it decides it cares. Fetching bodies would
+also make this connector the place where a mailbox's whole content passes
+through boid's logs.
+
+## Identity is the THREAD, not the message
+
+A reply to a mail you have already been given a card for is the same piece
+of work. Keying identity on ``threadId`` collapses a conversation onto one
+card; keying it on the message id would open a new card per reply.
+
+Pack contract (``signal-ingest-detailed-design.md`` §5.3/§7.2):
+
+- input: ``BOID_SIGNAL_SERVICE`` / ``BOID_SIGNAL_CONNECTOR`` /
+  ``BOID_SIGNAL_CONFIG`` (JSON) + ``BOID_API_BASE`` / ``BOID_API_CA_FILE``.
+- bookmark: ``boid signal cursor``, never a local file. Enforced here, not
+  delegated to Gmail's ``after:`` (which has second granularity at best).
+- external fetch: through the gateway only. This process never holds a
+  Google credential — the instance it is pointed at is an OAuth2 service and
+  the gateway refreshes the token itself.
+- output: JSONL to ``boid signal ingest``, oldest-first, chunked.
+- exit: 0 on success, non-zero on any failure.
+"""
+from __future__ import annotations
+
+import json
+import os
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Sequence
+
+DEFAULT_TIMEOUT_SECONDS = 30
+
+#: Safety cap on list pagination. Reaching it raises rather than truncating
+#: — a dropped page shows up only as "signals that never arrive".
+MAX_PAGES = 20
+
+#: Ids per list page. The per-message metadata fetch after it is what costs,
+#: so this stays modest rather than at Gmail's 500 ceiling.
+DEFAULT_MAX_RESULTS = 50
+
+#: How far back the very first (cursor-less) run looks. Without a bound the
+#: first run either pulls an entire mailbox or exceeds MAX_PAGES and raises
+#: on every run forever — a raise never reaches ingest, and the cursor only
+#: advances inside ingest, so the next run repeats the same query.
+DEFAULT_INITIAL_WINDOW_DAYS = 7
+
+INGEST_CHUNK_SIZE = 200
+
+#: **Not overridable.** This IS the connector; a workspace wanting a wider
+#: scope wants a different one. `config.extra_query` is ANDed onto it.
+BASE_QUERY = "is:unread to:me"
+
+#: Headers asked for by name. `format=metadata` without this returns every
+#: header, including the routing chain — noise this connector has no use for.
+METADATA_HEADERS = ("Subject", "From", "Date")
+
+
+class GatewayError(Exception):
+    def __init__(self, service: str, path: str, status: int, body: str) -> None:
+        self.service = service
+        self.path = path
+        self.status = status
+        self.body = body
+        snippet = body if len(body) <= 500 else body[:500] + "…"
+        super().__init__(f"boid API gateway: {service}{path} -> HTTP {status}: {snippet}")
+
+
+class PaginationExhaustedError(Exception):
+    """List pagination hit MAX_PAGES before running out of results."""
+
+
+def _base_url() -> str:
+    base = os.environ.get("BOID_API_BASE")
+    if not base:
+        raise GatewayError("", "", 0, "BOID_API_BASE is not set")
+    return base.rstrip("/")
+
+
+def _ssl_context() -> "ssl.SSLContext | None":
+    cafile = os.environ.get("BOID_API_CA_FILE")
+    if not cafile:
+        return None
+    return ssl.create_default_context(cafile=cafile)
+
+
+def gateway_get(
+    service: str,
+    path: str,
+    params: "Sequence[tuple[str, str]] | Mapping[str, str] | None" = None,
+    *,
+    urlopen: Any = urllib.request.urlopen,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Any:
+    """GET one path through the boid API gateway.
+
+    ``params`` accepts a SEQUENCE of pairs as well as a mapping — Gmail's
+    metadata fetch repeats ``metadataHeaders`` once per header, which a
+    mapping cannot express.
+
+    No ``Authorization`` header is built here: the gateway injects the real
+    credential and strips anything the client sent.
+    """
+    url = f"{_base_url()}/{service}{path}"
+    if params:
+        pairs = list(params.items()) if isinstance(params, Mapping) else list(params)
+        url += "?" + urllib.parse.urlencode(pairs)
+    request = urllib.request.Request(url)
+    try:
+        with urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+            body = response.read().decode("utf-8")
+            status = getattr(response, "status", 200)
+    except urllib.error.HTTPError as e:
+        raise GatewayError(service, path, e.code, e.read().decode("utf-8", "replace")) from e
+    except urllib.error.URLError as e:
+        raise GatewayError(service, path, 0, str(e.reason)) from e
+    if status < 200 or status >= 300:
+        raise GatewayError(service, path, status, body)
+    if not body.strip():
+        return {}
+    return json.loads(body)
+
+
+def parse_cursor(value: str) -> "datetime | None":
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _to_rfc3339(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_query(cursor_at: "datetime | None", now: datetime, *, initial_window_days: float, extra: str = "") -> str:
+    """The Gmail search string for this run.
+
+    ``after:`` takes a unix timestamp and is coarse (Gmail rounds it), which
+    is exactly why the cursor is ALSO enforced after fetching — see
+    ``collect_envelopes``. Its job here is only to keep the query bounded.
+    """
+    floor = cursor_at if cursor_at is not None else now - timedelta(days=initial_window_days)
+    query = f"{BASE_QUERY} after:{int(floor.timestamp())}"
+    return f"{query} {extra}".strip() if extra else query
+
+
+def _list_ids(service: str, query: str, *, max_results: int, get: Any = gateway_get) -> list[str]:
+    """Page through ``users.messages.list`` collecting message ids."""
+    ids: list[str] = []
+    page_token = ""
+    for _ in range(MAX_PAGES):
+        params = {"q": query, "maxResults": str(max_results)}
+        if page_token:
+            params["pageToken"] = page_token
+        payload = get(service, "/gmail/v1/users/me/messages", params)
+        if not isinstance(payload, Mapping):
+            raise GatewayError(service, "/gmail/v1/users/me/messages", 0, f"expected a JSON object, got {type(payload).__name__}")
+        for item in payload.get("messages") or ():
+            if isinstance(item, Mapping) and isinstance(item.get("id"), str):
+                ids.append(item["id"])
+        page_token = str(payload.get("nextPageToken") or "")
+        if not page_token:
+            return ids
+    raise PaginationExhaustedError(
+        f"messages.list pagination exceeded {MAX_PAGES} pages — refusing to truncate silently"
+    )
+
+
+def _headers_of(message: Mapping[str, Any]) -> dict:
+    payload = message.get("payload")
+    headers = payload.get("headers") if isinstance(payload, Mapping) else None
+    out: dict = {}
+    for h in headers or ():
+        if isinstance(h, Mapping) and isinstance(h.get("name"), str):
+            out[h["name"].lower()] = h.get("value")
+    return out
+
+
+def _fetch_metadata(service: str, message_id: str, *, get: Any = gateway_get) -> "dict | None":
+    """One message's envelope fields. **Never the body** — a Signal says
+    something happened, it does not carry content."""
+    params = [("format", "metadata")] + [("metadataHeaders", h) for h in METADATA_HEADERS]
+    message = get(service, f"/gmail/v1/users/me/messages/{message_id}", params)
+    return message if isinstance(message, Mapping) else None
+
+
+def collect_envelopes(
+    *,
+    service: str,
+    cursor_at: "datetime | None",
+    now: datetime,
+    max_results: int = DEFAULT_MAX_RESULTS,
+    initial_window_days: float = DEFAULT_INITIAL_WINDOW_DAYS,
+    extra_query: str = "",
+    get: Any = gateway_get,
+) -> list[dict]:
+    """Fetch, post-filter, and shape one run's Signal rows (envelope v0).
+
+    **The cursor is enforced here.** Gmail's ``after:`` is coarse and
+    inclusive, so the newest message would come back on every run — and
+    while it stays the newest, the bookmark could never move past it, so it
+    would be re-ingested forever. One comparison removes the class.
+
+    ``identity`` is the THREAD (see the module docstring); ``id`` is the
+    message, so each new reply is its own Signal on the same card.
+
+    Returned oldest-first (§5.3).
+    """
+    query = build_query(cursor_at, now, initial_window_days=initial_window_days, extra=extra_query)
+    ids = _list_ids(service, query, max_results=max_results, get=get)
+
+    rows: list[dict] = []
+    skipped_unreadable = skipped_before_cursor = 0
+    for message_id in ids:
+        message = _fetch_metadata(service, message_id, get=get)
+        internal = message.get("internalDate") if message else None
+        thread_id = message.get("threadId") if message else None
+        if not message or not isinstance(thread_id, str) or not thread_id:
+            skipped_unreadable += 1
+            continue
+        try:
+            at = datetime.fromtimestamp(int(internal) / 1000, tz=timezone.utc)
+        except (TypeError, ValueError):
+            skipped_unreadable += 1
+            continue
+        if cursor_at is not None and at <= cursor_at:
+            skipped_before_cursor += 1
+            continue
+        headers = _headers_of(message)
+        occurred_at = _to_rfc3339(at)
+        row = {
+            "id": message_id,
+            "occurred_at": occurred_at,
+            "identity": f"gmail-thread:{thread_id}",
+            # A permalink the human and the judgment can both open.
+            "url": f"https://mail.google.com/mail/u/0/#all/{message_id}",
+        }
+        sender = headers.get("from")
+        if isinstance(sender, str) and sender:
+            # The self-authored screen reads this. A mail YOU sent that is
+            # somehow unread is not something to open a card for.
+            row["author"] = sender
+        subject = headers.get("subject")
+        if isinstance(subject, str) and subject:
+            row["title"] = subject
+        rows.append(row)
+
+    rows.sort(key=lambda r: (r["occurred_at"], r["id"]))
+    if skipped_unreadable or skipped_before_cursor:
+        print(
+            f"unread-to-me: dropped {skipped_unreadable + skipped_before_cursor} message(s) "
+            f"(unreadable={skipped_unreadable} before_cursor={skipped_before_cursor})",
+            file=sys.stderr,
+        )
+    return rows
+
+
+def get_cursor(*, run: Any = subprocess.run) -> str:
+    proc = run(["boid", "signal", "cursor"], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"boid signal cursor: {proc.stderr.strip()}")
+    return str(json.loads(proc.stdout).get("cursor") or "")
+
+
+def ingest_signals(rows: Sequence[Mapping[str, Any]], *, run: Any = subprocess.run, chunk_size: int = INGEST_CHUNK_SIZE) -> None:
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        payload = "\n".join(json.dumps(dict(row), ensure_ascii=False) for row in chunk) + "\n"
+        proc = run(["boid", "signal", "ingest"], input=payload, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"boid signal ingest: {proc.stderr.strip()}")
+
+
+def main() -> int:
+    service = os.environ.get("BOID_SIGNAL_SERVICE") or ""
+    if not service:
+        print("unread-to-me: BOID_SIGNAL_SERVICE is not set", file=sys.stderr)
+        return 1
+    try:
+        config = json.loads(os.environ.get("BOID_SIGNAL_CONFIG") or "{}")
+    except ValueError as e:
+        print(f"unread-to-me: BOID_SIGNAL_CONFIG is not valid JSON: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(config, dict):
+        print("unread-to-me: BOID_SIGNAL_CONFIG must be a JSON object", file=sys.stderr)
+        return 1
+
+    try:
+        rows = collect_envelopes(
+            service=service,
+            cursor_at=parse_cursor(get_cursor(run=subprocess.run)),
+            now=datetime.now(timezone.utc),
+            max_results=int(config.get("max_results") or DEFAULT_MAX_RESULTS),
+            initial_window_days=float(config.get("initial_window_days") or DEFAULT_INITIAL_WINDOW_DAYS),
+            extra_query=str(config.get("extra_query") or ""),
+            get=gateway_get,
+        )
+        if rows:
+            ingest_signals(rows, run=subprocess.run)
+    except Exception as e:
+        print(f"unread-to-me: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

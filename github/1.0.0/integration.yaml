@@ -1,0 +1,47 @@
+apiVersion: boid.dev/v1
+kind: IntegrationPack
+metadata:
+  name: github
+  version: 1.0.0
+
+serviceProfiles:
+  - name: github
+    # api.github.com is fixed for github.com, but GitHub Enterprise Server
+    # tenants have their own host, so the endpoint genuinely varies per
+    # instance. (v0's loader has no Pack-declared default-endpoint mechanism
+    # anyway — a `configurable: false` profile cannot be used by any `uses:`
+    # entry at all — so this would say `true` regardless. See bitbucket-cloud's
+    # own note.)
+    endpoint:
+      configurable: true
+    credentials:
+      # A personal access token, sent as `Authorization: Bearer <token>`.
+      # GitHub accepts both `Bearer` and the older `token` scheme for PATs;
+      # bearer is what the REST docs now prescribe.
+      - name: token
+        injection: bearer
+
+connectors:
+  - name: assigned-issues
+    executable: connectors/assigned-issues
+    serviceProfile: github
+    configSchema:
+      type: object
+      properties:
+        # Which slice of `GET /issues` to watch. GitHub's own vocabulary:
+        # assigned (default) / created / mentioned / subscribed / all.
+        filter:
+          type: string
+        # Search page size (GitHub caps this at 100).
+        per_page:
+          type: number
+        # How far back the very first, cursor-less run looks. Without a bound
+        # the first run pulls every assigned issue ever — see the connector's
+        # own note on why an unbounded first run is a trap that never clears.
+        initial_window_days:
+          type: number
+
+skills:
+  - name: github-api
+    path: skills/github-api
+    requiresServiceProfile: github

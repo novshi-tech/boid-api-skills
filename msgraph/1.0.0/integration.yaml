@@ -1,0 +1,44 @@
+apiVersion: boid.dev/v1
+kind: IntegrationPack
+metadata:
+  name: msgraph
+  version: 1.0.0
+
+serviceProfiles:
+  - name: msgraph
+    endpoint:
+      configurable: true
+    credentials:
+      # Declared for completeness, and NOT how a real instance is wired —
+      # same situation as the gmail Pack, see its manifest for the full note.
+      # Microsoft Graph is OAuth2 (device flow + refresh) and a Pack
+      # credential slot can only express a STATIC secret, so a workspace
+      # points this connector at its existing oauth2 service instance
+      # (`msgraph`, `auth: {kind: oauth2, provider: microsoft}`) and the
+      # gateway refreshes the token itself. boid never cross-checks a
+      # connector's declared profile against the instance it is given.
+      - name: token
+        injection: bearer
+
+connectors:
+  - name: unread-to-me
+    executable: connectors/unread-to-me
+    serviceProfile: msgraph
+    configSchema:
+      type: object
+      properties:
+        # Which mail folder to watch. Graph's well-known names work here
+        # (inbox is the default); a folder id also works.
+        folder:
+          type: string
+        # Page size for the message list.
+        top:
+          type: number
+        # How far back the very first, cursor-less run looks.
+        initial_window_days:
+          type: number
+
+skills:
+  - name: microsoft-graph-api
+    path: skills/microsoft-graph-api
+    requiresServiceProfile: msgraph

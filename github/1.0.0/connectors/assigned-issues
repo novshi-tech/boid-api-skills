@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""github Integration Pack — ``assigned-issues`` connector.
+
+Detects issues and pull requests assigned to the gateway's authenticated
+account that have been updated since this connector's bookmark, and hands
+them to boid as Signals (envelope v0).
+
+Same shape as the jira-cloud ``assigned-issues`` connector, and for the
+same reasons — read that one alongside this if you are writing a third.
+The parts worth knowing here:
+
+- **``GET /issues`` already answers the whole question.** It returns every
+  issue AND pull request assigned to the authenticated user across every
+  repository they can see, newest activity first or last as asked. There
+  is no per-repository configuration to keep in step with reality, which
+  is the failure mode a "watch these repos" list would have.
+- **``state=all``, deliberately.** A close, a merge, and a comment all move
+  ``updated_at``, and all three are things a human wants to hear about.
+  Scoping to open items looks tidier and quietly loses the most important
+  event of an item's life — the sibling bitbucket-cloud connector shipped
+  with an open-only scope and produced zero signals for a PR that was
+  commented on and closed in the same breath, which is exactly the shape
+  this avoids.
+- **No ``author``.** GitHub's issue payload says who opened the item, not
+  who caused this update. Putting the opener there would make the
+  self-authored screen drop other people's comments on your own issue,
+  which is the opposite of what it is for. Absent is honest; the judgment
+  reads the item itself.
+
+Pack contract (``signal-ingest-detailed-design.md`` §5.3/§7.2):
+
+- input: ``BOID_SIGNAL_SERVICE`` / ``BOID_SIGNAL_CONNECTOR`` /
+  ``BOID_SIGNAL_CONFIG`` (JSON) + ``BOID_API_BASE`` / ``BOID_API_CA_FILE``.
+  No CLI arguments.
+- bookmark: read via ``boid signal cursor`` (never a local file). The
+  cursor contract is enforced HERE, not delegated to the ``since``
+  parameter — see ``collect_envelopes``.
+- external fetch: ``$BOID_API_BASE/$BOID_SIGNAL_SERVICE/...`` only, via the
+  standard library. This process never holds a GitHub token; the gateway
+  injects it.
+- output: JSONL to ``boid signal ingest``'s stdin, oldest-first, chunked.
+- exit: 0 on success, non-zero on any failure — nothing is swallowed.
+"""
+from __future__ import annotations
+
+import json
+import os
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Sequence
+
+#: Gateway call timeout. This connector's derived trigger runs on a fixed
+#: schedule — a single stuck call must not hang past it.
+DEFAULT_TIMEOUT_SECONDS = 30
+
+#: Safety cap on pagination. Reaching it without exhausting the result set
+#: raises rather than truncating: a silently dropped page shows up only as
+#: "signals that never arrive", which nothing can detect from outside.
+MAX_PAGES = 20
+
+#: GitHub caps `per_page` at 100.
+DEFAULT_PER_PAGE = 100
+
+#: How far back the very first run (empty cursor) looks.
+#:
+#: Without it, the first run either pulls an account's entire assigned
+#: history at once or — past MAX_PAGES worth — raises on every run forever:
+#: a raise means the run never reaches ingest, the cursor only ever advances
+#: inside ingest, so the next run repeats the identical unbounded query.
+#: boid has no way to seed a cursor out of band, so this bound is the only
+#: exit from that trap.
+DEFAULT_INITIAL_WINDOW_DAYS = 30
+
+#: Rows per ``boid signal ingest`` call. Each call is its own transaction,
+#: so chunking bounds both memory and how much progress a mid-run crash
+#: loses, without changing the net result (ingest dedups and only ever
+#: advances the cursor forward).
+INGEST_CHUNK_SIZE = 200
+
+#: GitHub's own vocabulary for `GET /issues?filter=`.
+DEFAULT_FILTER = "assigned"
+VALID_FILTERS = ("assigned", "created", "mentioned", "subscribed", "all")
+
+
+class GatewayError(Exception):
+    """A boid API gateway call finished with a non-2xx status.
+
+    Carries the raw status and body rather than reclassifying gateway
+    failures (403/502/...) against upstream GitHub ones — the caller just
+    surfaces the message and exits non-zero.
+    """
+
+    def __init__(self, service: str, path: str, status: int, body: str) -> None:
+        self.service = service
+        self.path = path
+        self.status = status
+        self.body = body
+        snippet = body if len(body) <= 500 else body[:500] + "…"
+        super().__init__(f"boid API gateway: {service}{path} -> HTTP {status}: {snippet}")
+
+
+class PaginationExhaustedError(Exception):
+    """Pagination hit MAX_PAGES before running out of results."""
+
+
+def _base_url() -> str:
+    base = os.environ.get("BOID_API_BASE")
+    if not base:
+        raise GatewayError("", "", 0, "BOID_API_BASE is not set")
+    return base.rstrip("/")
+
+
+def _ssl_context() -> "ssl.SSLContext | None":
+    cafile = os.environ.get("BOID_API_CA_FILE")
+    if not cafile:
+        return None
+    return ssl.create_default_context(cafile=cafile)
+
+
+def gateway_get(
+    service: str,
+    path: str,
+    params: "Mapping[str, str] | None" = None,
+    *,
+    urlopen: Any = urllib.request.urlopen,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Any:
+    """GET one path through the boid API gateway.
+
+    No ``Authorization`` header is built here — the gateway injects the real
+    GitHub credential server-side and strips anything the client sent.
+    ``urlopen`` is the injection point for tests, which never touch the
+    network.
+    """
+    url = f"{_base_url()}/{service}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+    try:
+        with urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+            body = response.read().decode("utf-8")
+            status = getattr(response, "status", 200)
+    except urllib.error.HTTPError as e:  # noqa: PERF203 - the body is the diagnostic
+        raise GatewayError(service, path, e.code, e.read().decode("utf-8", "replace")) from e
+    except urllib.error.URLError as e:
+        raise GatewayError(service, path, 0, str(e.reason)) from e
+    if status < 200 or status >= 300:
+        raise GatewayError(service, path, status, body)
+    if not body.strip():
+        return []
+    return json.loads(body)
+
+
+def _parse_time(value: object) -> "datetime | None":
+    """Parse GitHub's RFC3339 timestamps (always UTC, ``...Z``).
+
+    Returns None rather than raising: one unreadable timestamp costs one
+    row, not the run.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def parse_cursor(value: str) -> "datetime | None":
+    """Parse the RFC3339 string ``boid signal cursor`` returns. Empty or
+    unreadable means "no bookmark yet" — the caller then applies
+    ``initial_window_days`` rather than searching from the beginning."""
+    return _parse_time(value)
+
+
+def _to_rfc3339(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _since(cursor_at: "datetime | None", now: datetime, initial_window_days: float) -> str:
+    """The ``since`` query value: the cursor if there is one, otherwise a
+    bounded window back from now (see DEFAULT_INITIAL_WINDOW_DAYS)."""
+    if cursor_at is not None:
+        return _to_rfc3339(cursor_at)
+    return _to_rfc3339(now - timedelta(days=initial_window_days))
+
+
+def _list_issues(
+    service: str,
+    *,
+    filter_: str,
+    since: str,
+    per_page: int,
+    get: Any = gateway_get,
+) -> list[dict]:
+    """Page through ``GET /issues`` until a short page arrives.
+
+    Asks for ``direction=asc`` on ``updated`` so pages arrive oldest-first,
+    which keeps the cursor advancing monotonically even if the run is cut
+    short partway through ingest.
+    """
+    items: list[dict] = []
+    for page in range(1, MAX_PAGES + 1):
+        batch = get(
+            service,
+            "/issues",
+            {
+                "filter": filter_,
+                "state": "all",
+                "sort": "updated",
+                "direction": "asc",
+                "since": since,
+                "per_page": str(per_page),
+                "page": str(page),
+            },
+        )
+        if not isinstance(batch, list):
+            raise GatewayError(service, "/issues", 0, f"expected a JSON array, got {type(batch).__name__}")
+        items.extend(x for x in batch if isinstance(x, Mapping))
+        if len(batch) < per_page:
+            return items
+    raise PaginationExhaustedError(
+        f"/issues pagination exceeded {MAX_PAGES} pages — refusing to truncate silently"
+    )
+
+
+def _repo_of(item: Mapping[str, Any]) -> str:
+    """``owner/repo`` for one item.
+
+    ``GET /issues`` embeds a ``repository`` object; a per-repository listing
+    would not, so fall back to slicing the API url. Returning "" makes the
+    caller drop the row (it has no identity to file it under).
+    """
+    repo = item.get("repository")
+    if isinstance(repo, Mapping):
+        full = repo.get("full_name")
+        if isinstance(full, str) and full:
+            return full
+    url = item.get("repository_url")
+    if isinstance(url, str) and "/repos/" in url:
+        return url.rsplit("/repos/", 1)[1]
+    return ""
+
+
+def collect_envelopes(
+    *,
+    service: str,
+    filter_: str,
+    cursor_at: "datetime | None",
+    now: datetime,
+    per_page: int = DEFAULT_PER_PAGE,
+    initial_window_days: float = DEFAULT_INITIAL_WINDOW_DAYS,
+    get: Any = gateway_get,
+) -> list[dict]:
+    """Fetch, post-filter, and shape one run's Signal rows (envelope v0).
+
+    **The cursor is enforced here, not by ``since``.** GitHub documents
+    ``since`` as "last updated after", but an inclusive boundary would
+    re-emit the newest item on every single run — and once that item is the
+    newest, the bookmark can never move past it, so the connector would
+    re-ingest the same row forever. Dropping anything at-or-before the
+    cursor after fetching costs one comparison and removes the whole class.
+
+    ``id`` is built from the NORMALIZED timestamp, never GitHub's raw
+    string: dedup is keyed on ``id``, so any rendering difference in the
+    raw value would make the same event look new.
+
+    Returned oldest-first (§5.3), re-sorted explicitly rather than trusting
+    the query's own ordering to survive paging.
+    """
+    since = _since(cursor_at, now, initial_window_days)
+    items = _list_issues(service, filter_=filter_, since=since, per_page=per_page, get=get)
+
+    rows: list[dict] = []
+    skipped_no_repo = skipped_unparsable = skipped_before_cursor = 0
+    for item in items:
+        repo = _repo_of(item)
+        number = item.get("number")
+        if not repo or not isinstance(number, int):
+            skipped_no_repo += 1
+            continue
+        at = _parse_time(item.get("updated_at"))
+        if at is None:
+            skipped_unparsable += 1
+            continue
+        if cursor_at is not None and at <= cursor_at:
+            skipped_before_cursor += 1
+            continue
+        occurred_at = _to_rfc3339(at)
+        ref = f"{repo}#{number}"
+        row = {
+            "id": f"{ref}:{occurred_at}",
+            "occurred_at": occurred_at,
+            "identity": f"github:{ref}",
+        }
+        html_url = item.get("html_url")
+        if isinstance(html_url, str) and html_url:
+            row["url"] = html_url
+        title = item.get("title")
+        if isinstance(title, str) and title:
+            # Carried for the human reading `boid signal list`; the judgment
+            # side discards it and reads the item itself.
+            row["title"] = title
+        rows.append(row)
+
+    rows.sort(key=lambda r: (r["occurred_at"], r["id"]))
+    if skipped_no_repo or skipped_unparsable or skipped_before_cursor:
+        # Not a failure — a handful of drops is routine. Reported so that a
+        # SYSTEMIC cause (a payload shape change zeroing every row) is
+        # visible somewhere, instead of manifesting only as "exits 0, nothing
+        # ever arrives", which trips no failure detection at all.
+        print(
+            f"assigned-issues: dropped {skipped_no_repo + skipped_unparsable + skipped_before_cursor} item(s) "
+            f"(no_repo={skipped_no_repo} unparsable_updated={skipped_unparsable} "
+            f"before_cursor={skipped_before_cursor})",
+            file=sys.stderr,
+        )
+    return rows
+
+
+def get_cursor(*, run: Any = subprocess.run) -> str:
+    """Read this connector's own bookmark via ``boid signal cursor`` — never
+    a local file. Takes no arguments: the shim resolves which (service,
+    connector) to read from this process's own environment."""
+    proc = run(["boid", "signal", "cursor"], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"boid signal cursor: {proc.stderr.strip()}")
+    data = json.loads(proc.stdout)
+    return str(data.get("cursor") or "")
+
+
+def ingest_signals(rows: Sequence[Mapping[str, Any]], *, run: Any = subprocess.run, chunk_size: int = INGEST_CHUNK_SIZE) -> None:
+    """Write ``rows`` to ``boid signal ingest`` as JSONL in the order given
+    (the caller orders them; this does not re-sort). Each chunk is its own
+    transaction, so a crash partway through still leaves the cursor correct
+    for whatever was ingested."""
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        payload = "\n".join(json.dumps(dict(row), ensure_ascii=False) for row in chunk) + "\n"
+        proc = run(["boid", "signal", "ingest"], input=payload, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"boid signal ingest: {proc.stderr.strip()}")
+
+
+def main() -> int:
+    service = os.environ.get("BOID_SIGNAL_SERVICE") or ""
+    if not service:
+        print("assigned-issues: BOID_SIGNAL_SERVICE is not set", file=sys.stderr)
+        return 1
+
+    try:
+        config = json.loads(os.environ.get("BOID_SIGNAL_CONFIG") or "{}")
+    except ValueError as e:
+        print(f"assigned-issues: BOID_SIGNAL_CONFIG is not valid JSON: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(config, dict):
+        print("assigned-issues: BOID_SIGNAL_CONFIG must be a JSON object", file=sys.stderr)
+        return 1
+
+    filter_ = str(config.get("filter") or DEFAULT_FILTER)
+    if filter_ not in VALID_FILTERS:
+        # Rejected rather than silently corrected: GitHub answers an unknown
+        # filter with its own default, so the connector would quietly watch
+        # the wrong slice forever.
+        print(
+            f"assigned-issues: filter {filter_!r} is not one of {', '.join(VALID_FILTERS)}",
+            file=sys.stderr,
+        )
+        return 1
+    per_page = min(int(config.get("per_page") or DEFAULT_PER_PAGE), 100)
+    initial_window_days = float(config.get("initial_window_days") or DEFAULT_INITIAL_WINDOW_DAYS)
+
+    # Every failure from here is surfaced (stderr + exit 1), never swallowed
+    # — a connector's non-zero exit is what feeds boid's failure-streak
+    # notification.
+    try:
+        rows = collect_envelopes(
+            service=service,
+            filter_=filter_,
+            cursor_at=parse_cursor(get_cursor(run=subprocess.run)),
+            now=datetime.now(timezone.utc),
+            per_page=per_page,
+            initial_window_days=initial_window_days,
+            get=gateway_get,
+        )
+        if rows:
+            ingest_signals(rows, run=subprocess.run)
+    except Exception as e:  # top-level boundary: message + exit 1
+        print(f"assigned-issues: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
