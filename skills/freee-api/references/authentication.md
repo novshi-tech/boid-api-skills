@@ -12,10 +12,11 @@ boid配下のジョブは資格情報そのものを保持しない設計にな�
 - 送っても意味がない: ゲートウェイは受け取ったリクエストから `Authorization` / `Cookie` / `Proxy-Authorization` を必ず剥がしてから転送する
 - `--cacert "$BOID_API_CA_FILE"` を付けてTLS証明書を検証できるようにする
 - **`company_id` は別問題。** ゲートウェイはOAuthトークンの注入は代行するが、`company_id`（後述）はfreee APIのビジネスロジック上のパラメータであり、ゲートウェイは関知しない。クライアント側が毎回明示的に付与する必要がある
+- **`freee` はaccount修飾（`@ubs`/`@nvt`）が必須。** `services.freee.require_account: true` が設定されているため、account無しの `freee/...` へのリクエストは400になる。どちらのaccountを使うべきかの判断基準は [SKILL.md](../SKILL.md) の「アカウントの選び方」を参照（本ファイルでは扱わない）
 
 ```bash
 curl --cacert "$BOID_API_CA_FILE" \
-  "$BOID_API_BASE/freee/api/1/companies"
+  "$BOID_API_BASE/freee@ubs/api/1/companies"
 ```
 
 （`GET /api/1/companies` は認可済みユーザーがアクセス可能な事業所一覧を返す軽量なエンドポイントで、疎通確認や `company_id` の解決によく使われる。company_idを一切要求しない数少ないエンドポイントの一つ）
@@ -29,7 +30,7 @@ oauth_providers:
   freee:
     token_endpoint: https://accounts.secure.freee.co.jp/public_api/token
     client_id: <freeeアプリのclient_id>
-    client_secret_key: freee_oauth_client_secret   # secret store 参照（confidential clientのみ）
+    client_secret_key: freee_oauth_client_secret   # secret store 参照（confidential clientのみ。accountで修飾されない、後述）
     scopes: [read, write]
     flow: manual                                   # OOB — freeeはPKCE非対応
     authorization_endpoint: https://accounts.secure.freee.co.jp/public_api/authorize
@@ -38,6 +39,7 @@ services:
   freee:
     base_url: https://api.freee.co.jp
     auth: { kind: oauth2, provider: freee }
+    require_account: true   # account修飾なしのリクエストを400で拒否する（下記「account修飾でcredentialを切り替える」参照）
 ```
 
 - `auth.kind: oauth2` は `secret_key` ではなく `provider` を必須とし、`oauth_providers.<name>` エントリを参照する
@@ -49,7 +51,32 @@ services:
 - 実際のリフレッシュトークン・アクセストークンの値は `oauth_providers.*` にもここには書かない。`boid secret oauth login freee`（`manual` フロー時は「表示された authorize URL をブラウザで開いて同意すると、画面に code が直接表示されるので、それを CLI のプロンプトに貼り付けます」という手順になる）または `boid secret set` で別途secret storeに投入する
 - 1つの `oauth_providers` エントリは複数serviceから共有できる。会計・人事労務・請求書・販売の4ドメインは単一ホスト（`https://api.freee.co.jp`）を共有するため、通常は `services.freee` 1つで4ドメインすべてをカバーできる（ドメインごとに `services` エントリを分ける必要は基本的にない）
 - 資格情報の解決・注入に失敗した場合、ゲートウェイは認証情報なしで転送せず502を返す（fail-closed）。`provider` が指す `oauth_providers` エントリ自体が存在しない場合も、config load時点ではクロスチェックされず、リクエスト時に502（`apigateway: oauth2 provider "..." is not configured`）になる
-- ゲートウェイは他にも401（job token自体が無効・期限切れ）、403（サービスが未有効化 or read-only jobでの書き込み試行）、404（パス不正）、503（シークレットストア未接続）を返しうる。ステータスごとの切り分けは [pagination-and-errors.md](pagination-and-errors.md) の一覧を参照
+- ゲートウェイは他にも400（account修飾の欠落・不正）、401（job token自体が無効・期限切れ）、403（サービスが未有効化 or read-only jobでの書き込み試行）、404（パス不正）、503（シークレットストア未接続）を返しうる。ステータスごとの切り分けは [pagination-and-errors.md](pagination-and-errors.md) の一覧を参照
+- `services.freee.require_account: true` は、account修飾なしのリクエストを400で弾く安全弁。指定漏れが「意図しない方のcredential」へ黙って落ちる事故を防ぐためのもので、既定値はfalse（`freee` 以外の一般serviceでは通常このフラグは立たない）
+
+### account修飾でcredentialを切り替える
+
+`freee` は `require_account: true` が設定されているため、1つの `services.freee` 定義に対して複数のcredentialセット（＝別々のfreeeログインユーザー・別々の事業所）を `<service>@<account>` で切り替えて使う。`freee` のaccountは **`ubs`** と **`nvt`** の2つ。**どちらを使うべきかの判断は本ファイルの範囲外 — [SKILL.md](../SKILL.md) の「アカウントの選び方」を参照すること。**
+
+secret storeのキーはaccountで修飾される:
+
+| 種別 | account無し（`freee` では使えない） | account = `ubs` | account = `nvt` |
+|---|---|---|---|
+| refresh_token | `oauth2:freee:refresh_token` | `oauth2:freee@ubs:refresh_token` | `oauth2:freee@nvt:refresh_token` |
+| access_token cache | `oauth2:freee:access_token_cache` | `oauth2:freee@ubs:access_token_cache` | `oauth2:freee@nvt:access_token_cache` |
+
+**`oauth_providers.freee.client_secret_key` はaccountで修飾されない。** `client_secret` はOAuthアプリ（provider）単位の値で、`ubs`/`nvt` どちらのアカウントでログインしても同じ `client_secret` を使う（1つのOAuthアプリに、別々のfreeeユーザーが個別に認可を与える形）。
+
+初回のログイン（認可コードの取得）はアカウントごとに1回ずつ必要:
+
+```bash
+boid secret oauth login freee --account ubs
+boid secret oauth login freee --account nvt
+```
+
+`--account` を省略すると無修飾のキー（`oauth2:freee:refresh_token` 等）に書き込まれるが、`freee` は `require_account: true` のためそのcredentialを使うリクエスト経路が存在しない。freeeに対してログインする場合は必ず `--account` を指定すること。
+
+存在しないaccountを指定してリクエストした場合（例: `freee@typo`）、実在する他のaccountのcredentialへは**フォールバックしない**。502で失敗する（fail-closed）。account修飾を書き忘れた場合の400との違いは [pagination-and-errors.md](pagination-and-errors.md) を参照。
 
 ### daemon側のトークン管理（rotating refresh token対応）
 
@@ -60,10 +87,11 @@ boidデーモンはfreeeを **「refresh tokenをローテーションするプ�
 - プロアクティブなリフレッシュ（`expires_at` の5分前倒し）を行い、複数リクエストが同時に来てもトークンリフレッシュ自体はsingleflightで1回に集約される
 - リフレッシュリクエスト（`grant_type=refresh_token`）には `scope` パラメータを送らない（freeeにはリフレッシュ時のscope概念自体がない）
 - freeeのaccess_tokenの寿命は概ね6時間程度（Microsoft/Google/GitHubの1時間程度より長め）とされる
+- この一連の管理（singleflight・キャッシュ・rotating refresh tokenの永続化順序）は **`ubs`/`nvt` それぞれのaccountで完全に独立して働く。** `ubs` 側のトークンがリフレッシュされても `nvt` 側のcredentialやキャッシュには一切影響しない（逆も同様）
 
 ### サービス名は固定ではない
 
-`freee` という名前はboidの組み込みデフォルトではなく、公式ドキュメントの例で使われている慣例的な名前にすぎない。実際に何という名前で `services:` に登録されているかは運用者の `config.yaml` 次第。不明な場合はコード内で決め打ちせず、環境や設定から確認するか、ユーザーに確認する。
+`freee` という名前はboidの組み込みデフォルトではなく、公式ドキュメントの例で使われている慣例的な名前にすぎない。実際に何という名前で `services:` に登録されているかは運用者の `config.yaml` 次第。不明な場合はコード内で決め打ちせず、環境や設定から確認するか、ユーザーに確認する。**account名（`ubs`/`nvt`）はこれとは別の軸。** サービス名が仮に `freee` 以外の名前で登録されていても、`<service名>@ubs` のようにaccountを付けて切り替える書き方自体は変わらない。
 
 ## 直接呼び出しの場合（boidサンドボックス外から）
 
@@ -156,8 +184,11 @@ Microsoft Graphの `/me/...` のように「トークンから暗黙にアクセ
 
 ### company_idの取得方法
 
+**`ubs`/`nvt` それぞれ別の事業所を返す。** どちらの事業所を指しているか文脈からまだ確定できない場合は、両方のaccountで叩いて結果を突き合わせるとよい（判断手順の全体は [SKILL.md](../SKILL.md) の「アカウントの選び方」参照）:
+
 ```bash
-curl --cacert "$BOID_API_CA_FILE" "$BOID_API_BASE/freee/api/1/companies"
+curl --cacert "$BOID_API_CA_FILE" "$BOID_API_BASE/freee@ubs/api/1/companies"
+curl --cacert "$BOID_API_CA_FILE" "$BOID_API_BASE/freee@nvt/api/1/companies"
 ```
 
 ```json
@@ -168,7 +199,7 @@ curl --cacert "$BOID_API_CA_FILE" "$BOID_API_BASE/freee/api/1/companies"
 }
 ```
 
-`companies[].id` が `company_id` として使う値。`freee-cli` は初回ログイン時にこのエンドポイントを叩いて結果をキャッシュし、以降は「デフォルト事業所」として使い回す設計になっている（複数事業所にアクセス可能なユーザーの場合、どの事業所を使うか明示的に選択・保存する必要がある）。
+`companies[].id` が `company_id` として使う値。`freee-cli` は初回ログイン時にこのエンドポイントを叩いて結果をキャッシュし、以降は「デフォルト事業所」として使い回す設計になっている（複数事業所にアクセス可能なユーザーの場合、どの事業所を使うか明示的に選択・保存する必要がある。ただしこれは `freee-cli` 側〔direct callではなく単一ユーザー単一事業所を前提としたCLI〕の話であり、boidゲートウェイ経由で `ubs`/`nvt` を切り替える話とは別軸）。
 
 ## 認証エラー時のレスポンス（直接呼び出しの場合）
 
@@ -177,4 +208,4 @@ curl --cacert "$BOID_API_CA_FILE" "$BOID_API_BASE/freee/api/1/companies"
 | 401 Unauthorized | トークン未指定・無効・期限切れ |
 | 403 Forbidden | トークンは有効だがスコープ不足、対象company_idへのアクセス権がない |
 
-ゲートウェイ経由の場合のエラー（401/403/404/502/503それぞれの原因の切り分け）は [pagination-and-errors.md](pagination-and-errors.md) の「boidゲートウェイが返すエラー」を参照。ゲートウェイ経由のエラーは上表のfreee標準の意味とは原因が異なることが多いので混同しないこと。
+ゲートウェイ経由の場合のエラー（400/401/403/404/502/503それぞれの原因の切り分け）は [pagination-and-errors.md](pagination-and-errors.md) の「boidゲートウェイが返すエラー」を参照。ゲートウェイ経由のエラーは上表のfreee標準の意味とは原因が異なることが多いので混同しないこと。

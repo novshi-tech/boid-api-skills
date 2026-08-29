@@ -23,7 +23,7 @@ curl --cacert "$BOID_API_CA_FILE" -G \
   --data-urlencode "company_id=123456" \
   --data-urlencode "payment_status=unsettled" \
   --data-urlencode "limit=50" \
-  "$BOID_API_BASE/freee/iv/invoices"
+  "$BOID_API_BASE/freee@ubs/iv/invoices"
 ```
 
 作成の一般的なfreee請求書APIのボディ構造（`company_id`/`issue_date`/`partner_id`/`invoice_contents[]`〔明細行〕等が想定されるが、正確なフィールドは公式リファレンスで確認すること）:
@@ -31,7 +31,7 @@ curl --cacert "$BOID_API_CA_FILE" -G \
 ```bash
 echo '{"company_id": 123456, "partner_id": 1, "issue_date": "2026-08-05", "invoice_contents": [...]}' | \
   curl --cacert "$BOID_API_CA_FILE" -X POST -H "Content-Type: application/json" \
-  --data-binary @- "$BOID_API_BASE/freee/iv/invoices"
+  --data-binary @- "$BOID_API_BASE/freee@ubs/iv/invoices"
 ```
 
 ## 見積書（quotations）

@@ -1,6 +1,6 @@
 ---
 name: freee-api
-description: freee API（会計/人事労務/請求書/販売の4製品の生のREST APIエンドポイント仕様、boidのAPIゲートウェイ経由での呼び出し方、OAuth 2.0認可コードフロー〔OOB・PKCE非対応〕、company_idの扱い、ページネーション、エラー形式、レート制限）をまとめたAPIリファレンススキル。対応範囲は社内の `freee-cli` が実装している範囲（会計/人事労務/請求書/販売の4ドメイン）に準拠する。`curl`やHTTPクライアント、SDKからfreee APIを直接叩くコードをboidサンドボックス内で書く・デバッグする・エンドポイント仕様を確認する場合に使用する。「freee APIのエンドポイントを教えて」「freee会計APIを叩くコードを書いて」「boid経由でfreeeを呼ぶには」「BOID_API_BASEでfreeeを呼びたい」「freee人事労務APIの従業員一覧のレスポンス形式は」「freee請求書APIで請求書を作成するには」「freee販売APIのcompany_idはどこに渡す」など、freee APIの仕様そのものに関する質問・実装依頼で使用する。既存の `freee-accounting`/`freee-hr`/`freee-invoice`/`freee-sales` CLIスキル（`freee-cli` 経由でのタスク実行、たとえば取引一覧を取る・請求書を作成するなど）を頼まれた場合はこのスキルではなくそれぞれのCLIラッパースキルを使うこと。
+description: freee API（会計/人事労務/請求書/販売の4製品の生のREST APIエンドポイント仕様、boidのAPIゲートウェイ経由での呼び出し方、**`ubs`/`nvt` の2つのcredential account修飾〔`freee@ubs` / `freee@nvt`〕とその判断基準**、OAuth 2.0認可コードフロー〔OOB・PKCE非対応〕、company_idの扱い、ページネーション、エラー形式、レート制限）をまとめたAPIリファレンススキル。対応範囲は社内の `freee-cli` が実装している範囲（会計/人事労務/請求書/販売の4ドメイン）に準拠する。`curl`やHTTPクライアント、SDKからfreee APIを直接叩くコードをboidサンドボックス内で書く・デバッグする・エンドポイント仕様を確認する場合に使用する。freeeは `require_account: true` が設定されておりaccount修飾なしのリクエストは400になるため、URLを組み立てる前に必ずどちらのアカウントかを判断すること。「freee APIのエンドポイントを教えて」「freee会計APIを叩くコードを書いて」「boid経由でfreeeを呼ぶには」「BOID_API_BASEでfreeeを呼びたい」「freeeはubsとnvtどちらのアカウントを使うべき」「freee@ubsで400/502になった」「freee人事労務APIの従業員一覧のレスポンス形式は」「freee請求書APIで請求書を作成するには」「freee販売APIのcompany_idはどこに渡す」など、freee APIの仕様そのものに関する質問・実装依頼で使用する。既存の `freee-accounting`/`freee-hr`/`freee-invoice`/`freee-sales` CLIスキル（`freee-cli` 経由でのタスク実行、たとえば取引一覧を取る・請求書を作成するなど）を頼まれた場合はこのスキルではなくそれぞれのCLIラッパースキルを使うこと。
 ---
 
 # freee API リファレンス（boid APIゲートウェイ経由）
@@ -46,6 +46,8 @@ freee API自体は**4ドメインすべてが単一ホスト `https://api.freee.
 
    `<service>` はboidの `config.yaml` の `services:` ブロックで運用者が定義したサービス名。**boidの公式ドキュメント（`docs/ja/reference/config-yaml.md`）はfreeeを丸ごとの `oauth_providers`/`services` 設定例として明示的に取り上げており、慣例的なサービス名は単一の `freee`**（`base_url: https://api.freee.co.jp` にマッピング）。4ドメインとも同じ単一ホストを共有するため、**ドメインごとにサービスを分ける必要はなく、`freee` サービス1つでaccounting/hr/invoice/salesの全パスを扱える**（パスプレフィックス自体〔`/api/1/...` 等〕をそのままtailとして渡せばよい）。ただしこれも固定の組み込み名ではないため、実際に何という名前で登録されているかは呼び出し元の `config.yaml` を確認するか、不明ならユーザーに確認すること。
 
+   **`freee` は `services.freee.require_account: true` が設定されており、`<service>` 単体（account修飾なし）でのリクエストは400で拒否される。** 実際には `<service>@<account>` の形（例: `freee@ubs`）で、1つのfreeeサービス定義に対して切り替え可能な複数のcredentialセット（＝別々のfreeeログインユーザー・別々の事業所）のうちどれを使うかまで指定する必要がある。**`freee` のaccountには `ubs` と `nvt` の2つがある。** どちらを使うべきかは呼び出しごとに判断が必要で、URLを組み立てる前に必ず後述の「アカウントの選び方」節を確認すること。
+
 3. ゲートウェイは以下を行う:
    - リクエストパス `/api/<job-token>/<service>/<tail>` をパースし、job tokenを検証する
    - `<service>` がそのjob tokenに許可されたサービス集合に含まれるかを確認する。**`services:` に定義しただけでは足りず、ワークスペース側で当該サービスを有効化していないと403になる**（`boid workspace services add <service>` 等でワークスペースの許可サービス集合〔`services_floor` との加算的なunion〕に追加する。詳細は [references/pagination-and-errors.md](references/pagination-and-errors.md)）
@@ -55,8 +57,9 @@ freee API自体は**4ドメインすべてが単一ホスト `https://api.freee.
    - リクエストの `<tail>` パス（クエリ文字列含む）はバイト単位でそのまま転送される
    - 実際のアップストリームのホスト名はエラー時も含めてサンドボックス側には一切見えない
    - 資格情報の注入に失敗した場合は認証情報なしで転送せず、502で失敗する（fail-closed）。ゲートウェイが返すエラーはfreeeのJSONエラー形式ではなく **プレーンテキスト**。詳細なステータス表は [references/pagination-and-errors.md](references/pagination-and-errors.md) を参照
+   - **account修飾（`<service>@<account>`）が必要なservice（freeeを含む）に対してaccountを付けずにリクエストすると400で拒否される。** 逆に、account修飾の書き方自体は正しくても、指定したaccount名のcredentialが存在しない場合（例: `freee@typo`）は資格情報解決の失敗として502になる — **存在するaccountへのフォールバックは一切しない。** この400と502の違いは [references/pagination-and-errors.md](references/pagination-and-errors.md) を参照
 
-つまり **クライアント側でfreeeの認証ヘッダを組み立てる必要はない（組み立てても剥がされて無視される）。** `$BOID_API_BASE/<service>/...` に対してリクエストを投げるだけでよい。
+つまり **クライアント側でfreeeの認証ヘッダを組み立てる必要はない（組み立てても剥がされて無視される）。** `$BOID_API_BASE/<service>/...`（freeeの場合は `$BOID_API_BASE/freee@<account>/...`）に対してリクエストを投げるだけでよい。
 
 ### ファイルダウンロード系エンドポイントの302リダイレクトには要注意（要検証）
 
@@ -64,31 +67,31 @@ freee API自体は**4ドメインすべてが単一ホスト `https://api.freee.
 
 ### curlでの基本形（ドメインごと）
 
-会計・人事労務・請求書・販売はパスプレフィックスが違うだけで、`$BOID_API_BASE/freee` の後ろに続けるパスが異なるだけである。
+会計・人事労務・請求書・販売はパスプレフィックスが違うだけで、`$BOID_API_BASE/freee@ubs` の後ろに続けるパスが異なるだけである（`@ubs` の部分がaccount修飾。以下は説明の便宜上 `ubs` で統一するが、実際にどちらのaccountを使うべきかは呼び出しごとに判断する必要がある — 「アカウントの選び方」節参照）。
 
 ```bash
 # 会計（Accounting）: 取引一覧
 curl --cacert "$BOID_API_CA_FILE" \
-  "$BOID_API_BASE/freee/api/1/deals?company_id=123456"
+  "$BOID_API_BASE/freee@ubs/api/1/deals?company_id=123456"
 
 # 人事労務（HR）: 従業員一覧
 curl --cacert "$BOID_API_CA_FILE" \
-  "$BOID_API_BASE/freee/hr/api/v1/employees?company_id=123456"
+  "$BOID_API_BASE/freee@ubs/hr/api/v1/employees?company_id=123456"
 
 # 請求書（Invoice）: 請求書一覧
 curl --cacert "$BOID_API_CA_FILE" \
-  "$BOID_API_BASE/freee/iv/invoices?company_id=123456"
+  "$BOID_API_BASE/freee@ubs/iv/invoices?company_id=123456"
 
 # 販売（Sales）: 案件一覧
 curl --cacert "$BOID_API_CA_FILE" \
-  "$BOID_API_BASE/freee/sm/businesses?company_id=123456"
+  "$BOID_API_BASE/freee@ubs/sm/businesses?company_id=123456"
 ```
 
 - `--cacert "$BOID_API_CA_FILE"` はゲートウェイが内部CAでTLS終端している場合に必要（省略すると証明書検証エラーになる）。`BOID_API_CA_FILE` が未設定であれば付けなくてよい
 - 独自の `Authorization` ヘッダは付けない（付けても無視される）
-- `freee` の部分は運用者が `config.yaml` で定義したサービス名に置き換える。慣例上この名前が使われるが確定ではない（前述の通り、boidの `config-yaml.md` はこの名前を明示的に採用している）
+- `freee` の部分は運用者が `config.yaml` で定義したサービス名に置き換える。慣例上この名前が使われるが確定ではない（前述の通り、boidの `config-yaml.md` はこの名前を明示的に採用している）。**`@ubs`/`@nvt` の部分（account修飾）はサービス名とは独立した軸で、サービス名が何であってもfreeeを呼ぶ場合は必ず付ける**
 - **どの呼び出しにも `company_id` クエリパラメータがほぼ必須**（詳細は後述の「company_idの扱い」節、および [references/authentication.md](references/authentication.md)）
-- このドキュメント内のURL例はすべて `$BOID_API_BASE/freee` をベースとして記述する。実装時は環境変数をそのまま使い、URLを直書きしない
+- このドキュメント内のURL例はすべて `$BOID_API_BASE/freee@ubs`（アカウントを切り替える例のみ `@nvt` も使う）をベースとして記述する。実装時は環境変数をそのまま使い、URLを直書きしない。**account部分をコピーしたまま使わず、実際の呼び出しでは毎回どちらのaccountかを判断すること**（「アカウントの選び方」参照）
 
 ### boidゲートウェイを経由しない/直接叩く場合
 
@@ -96,15 +99,34 @@ boidのサンドボックス外（ローカル開発、CI、他システムな�
 
 **判断基準:** `BOID_API_BASE` がセットされていればboidジョブ内なので必ずゲートウェイ経由で呼ぶ。**boidサンドボックス内であることが明らかなのに `BOID_API_BASE` が未設定の場合は、「このジョブにはAPIゲートウェイが配線されていない」ことを意味する。** サンドボックスは資格情報を保持せず外向きの通信も制限されているため、この状態で `https://api.freee.co.jp` に直接フォールバックしても成功しない。認証情報を自作したり直接呼び出しにフォールバックしたりせず、処理を止めてユーザーに「このジョブ向けにfreee相当のサービスがboidのAPIゲートウェイに登録・有効化されているか」を確認すること。
 
+## アカウントの選び方（最重要）
+
+`freee` サービスには **`ubs`** と **`nvt`** の2つのaccountがあり、それぞれ**別のfreeeログインユーザー・別の事業所**のデータに紐づく（`freee@ubs`/`freee@nvt` という形でURLに書く。詳細な機構は前述の「最重要: ベースURLはハードコードしない」の「仕組み」節を参照）。**どちらのaccountを使うかの判断は、URLの書き方そのものより重い。** 会計データの操作であり、誤ったaccountへの書き込みは実害のある事故になる。
+
+### なぜ「間違えても気づける」とは限らないのか
+
+存在しないaccount名を指定すれば502で気づける（[references/pagination-and-errors.md](references/pagination-and-errors.md)）。しかし **`ubs`/`nvt` の取り違え（＝どちらも実在する正しいaccount）は、リクエストがそのまま成功してしまう。** 別事業所への正しい資格情報として200が返るだけなので、レスポンスやステータスコードを見ても取り違えには気づけない。実行前にどちらのaccountかを確定させることが、唯一の防御線になる。
+
+### 何を根拠に判断するか
+
+- タスクの指示や、ここまでのやり取りの中に事業所名・会社名・ログインユーザーなど、どちらの事業所を指しているかの手がかりがないか（例:「UBSの取引を」「NVT側の請求書を」のような明示）
+- 同じ作業の中で直前に使ったfreee APIの呼び出し（既にどちらかのaccountで動いている）があれば、特に指示がない限りそれを引き継ぐのが自然
+- `company_id` が既にわかっている場合は、`GET /api/1/companies` を両accountで叩いて結果を突き合わせれば、どちらの事業所のIDと一致するかで確定できる（手順は [references/authentication.md](references/authentication.md) の「company_idの取得方法」参照）
+- 会話の一番最初の依頼まで遡って、会社名やアカウント名の言及を見落としていないか確認する
+
+### 文脈から確定できない場合は、推測せずユーザーに確認する
+
+読み取り専用の操作で、かつ「両方を見てから絞り込みたい」という目的自体が自然な場面（例えば上記のcompany_id突き合わせ）では、両accountに順に問い合わせて材料を揃えるという進め方もありうる。しかし **取引作成・請求書作成・従業員更新・承認アクションの実行など書き込み系操作では、文脈から確定できない限り、実行前に必ずユーザーに確認する。** 前述の通り取り違えはエラーにならず成立してしまうため、実行後に気づいて取り消す方法を探すより、実行前に一声確認する方が確実に安全。
+
 ## 認証
 
-クライアント自身が認証ヘッダを組み立てる必要は通常ない（ゲートウェイが代行する）。freeeのOAuth 2.0は **認可コードフロー（PKCE非対応・OOBリダイレクト）** という他社と異なる形状を持ち、boid側もこれに合わせた `flow: manual` という専用のログインフローを持つ。ゲートウェイ側の設定例、直接呼び出し時のOAuth 2.0フロー、company_idの解決手順、エラー時の切り分けは [references/authentication.md](references/authentication.md) を参照。
+クライアント自身が認証ヘッダを組み立てる必要は通常ない（ゲートウェイが代行する）。freeeのOAuth 2.0は **認可コードフロー（PKCE非対応・OOBリダイレクト）** という他社と異なる形状を持ち、boid側もこれに合わせた `flow: manual` という専用のログインフローを持つ。ゲートウェイ側の設定例、直接呼び出し時のOAuth 2.0フロー、company_idの解決手順、エラー時の切り分けは [references/authentication.md](references/authentication.md) を参照。`ubs`/`nvt` のaccountごとにcredentialがどう分かれるか（secret keyの形・ログインコマンド）も同ファイルの「account修飾でcredentialを切り替える」節にまとめてある。
 
 ## リソース別リファレンス
 
 タスクに応じて該当ファイルを読むこと。全部を毎回読み込む必要はない。
 
-- [references/authentication.md](references/authentication.md) - boidゲートウェイでの認証代行の仕組み（`flow: manual` の詳細）、直接呼び出し時のOAuth 2.0認可コード+OOBフロー・トークンリフレッシュ（rotating refresh token）、`company_id` の解決・付与方法
+- [references/authentication.md](references/authentication.md) - boidゲートウェイでの認証代行の仕組み（`flow: manual` の詳細）、**account修飾（`ubs`/`nvt`）によるcredential切り替えの詳細**、直接呼び出し時のOAuth 2.0認可コード+OOBフロー・トークンリフレッシュ（rotating refresh token）、`company_id` の解決・付与方法
 - [references/accounting.md](references/accounting.md) - 会計API（`/api/1/...`）: 取引まわり（deals/wallet_txns/transfers/manual_journals）、パートナー・品目マスタ（partners/account_items/sections/tags/segments/items）、経費・支払（expense_applications/payment_requests/approval_requests）、証憑・見積/請求（receipts/quotations/invoices）、集計・レポート（reports/journals）、組織設定（companies/users/banks/taxes/walletables/fixed_assets）
 - [references/hr.md](references/hr.md) - 人事労務API（`/hr/api/v1/...`）: 従業員とプロフィールサブリソース、勤怠（work_records/time_clocks/work_record_summaries）、給与・賞与明細、組織設定（groups/positions）、各種申請承認ワークフロー
 - [references/invoice.md](references/invoice.md) - 請求書API（`/iv/...`）: invoices/quotations/delivery_slips のCRUDとテンプレート一覧
@@ -113,8 +135,9 @@ boidのサンドボックス外（ローカル開発、CI、他システムな�
 
 ## 注意点
 
+- **`freee` を呼ぶには `@ubs`/`@nvt` のaccount修飾が必須で、間違えても200が返ってしまう（エラーで気づけない）。** 判断基準・迷ったときの進め方は前述の「アカウントの選び方」節を参照
 - **`company_id` がほぼ全エンドポイントで必須。** freeeは1つのOAuthトークンで複数事業所（company）にアクセスできる設計のため、Microsoft Graphの `/me` のような「トークンから暗黙に対象が決まる」仕組みがなく、**GET系はクエリパラメータ `company_id=...`、POST/PUT/PATCH系はJSONリクエストボディ内に `company_id` フィールドを含める**必要がある（`freee-cli` はリクエストボディをstdinから受け取ったJSONをそのまま転送するだけで、company_idの注入や検証を一切行わない。呼び出し側が自分でボディに含めること）。**DELETE系はドメインで扱いが割れている**: 会計APIのDELETEは一貫してクエリに `company_id` を付与するのに対し、`freee-cli` の実装を見る限り**人事労務APIのDELETE（employees/groups/positions/work_records/各種approval）は一律で `company_id` を付与していない**。freee API自体の仕様なのか `freee-cli` 側の実装漏れなのかは未検証。税区分の会社別参照（`GET /api/1/taxes/companies/{company_id}`、company_idがパスに埋め込まれる）のように別の扱いをするエンドポイントも存在する。詳細は [references/authentication.md](references/authentication.md) と各ドメインのreferenceファイルを参照
-- **company_idの取得方法:** `GET /api/1/companies`（会計APIのエンドポイントだが、人事労務/請求書/販売のcompany_idもここで得られる事業所IDと同一）を呼び、レスポンスの `companies[].id` を使う。`freee-cli` も初回ログイン時にこのエンドポイントを叩いて事業所一覧を保存し、以降のコマンドはデフォルト事業所を使い回す設計になっている
+- **company_idの取得方法:** `GET /api/1/companies`（会計APIのエンドポイントだが、人事労務/請求書/販売のcompany_idもここで得られる事業所IDと同一）を呼び、レスポンスの `companies[].id` を使う。`freee-cli` も初回ログイン時にこのエンドポイントを叩いて事業所一覧を保存し、以降のコマンドはデフォルト事業所を使い回す設計になっている（`ubs`/`nvt` どちらの事業所かを突き合わせで確定させる用途にも使える。「アカウントの選び方」参照）
 - **ページネーションは `offset`/`limit` のクエリパラメータ方式。** Microsoft Graphの `@odata.nextLink`（不透明な完全URL）やGmailの `nextPageToken` のようなカーソル/トークン方式ではなく、シンプルな数値オフセット指定。総件数を返すフィールドの有無はエンドポイントによって異なるため、空配列が返るまでoffsetをインクリメントして辿るのが安全。詳細は [references/pagination-and-errors.md](references/pagination-and-errors.md)
 - **エラーレスポンスの形は要検証。** `freee-cli` のクライアント実装（`internal/client/client.go`）は freee のエラーを `{"message": "...", "errors": [...], "status_code": ...}` という単純な形（`errors` を文字列配列として決め打ち）でパースしようとしているが、これは実装者の想定であり、freee公式のエラー仕様（フィールド単位のバリデーションエラーを配列で返す、エンドポイントによって形が違う可能性がある等）を正確に反映している保証はない。パース失敗時はレスポンスボディをそのまま文字列として扱っている（＝パースが外れても実害は小さい設計）。**重要な実装の前には実際のエラーレスポンスを一度観測して形を確認すること。** 詳細は [references/pagination-and-errors.md](references/pagination-and-errors.md)
 - **レート制限は30リクエスト/分が目安。** `freee-cli` はこれに合わせて2秒に1リクエストのクライアント側スロットリングを自前で行い、429時は `Retry-After` ヘッダー（あれば秒数を優先）または指数バックオフでリトライしている。boidゲートウェイ経由の場合もfreee自体のレート制限がそのまま透過するため、同様の自衛的なリトライ・スロットリングをクライアント側で実装することを推奨する
@@ -125,4 +148,4 @@ boidのサンドボックス外（ローカル開発、CI、他システムな�
 
 ## 本ドキュメントの情報源
 
-本ドキュメントの内容は `freee-cli` リポジトリ（`internal/client/client.go`, `internal/oauth/oauth.go`, `cmd/root.go`, `cmd/auth_login.go`, `cmd/configure.go`, `cmd/accounting_*.go`, `cmd/hr_*.go`, `cmd/invoice_*.go`, `cmd/sales_*.go`）と、boid リポジトリ（`internal/config/apigateway.go`, `internal/apigateway/oauth2.go`, `internal/apigateway/login.go`, `docs/ja/reference/config-yaml.md`, `docs/plans/api-gateway.md`）の調査に基づく記載。特に `docs/ja/reference/config-yaml.md` はfreeeを `oauth_providers`/`services` の具体的な設定例として明示的に取り上げており、本スキルのゲートウェイ設定の記述はこれを一次情報としている。ただし、`freee-cli` はリクエストボディやエラーレスポンスの中身を検証・整形せずほぼそのまま右から左に受け流す設計のため（stdin JSONをそのままPOST/PUT/PATCHボディに使い、レスポンスも `json.RawMessage` のまま返す）、**リクエストボディの必須フィールドやエラーレスポンスの正確な形については、CLIのコードだけでは検証しきれていない部分がある**（該当箇所はその都度「要検証」と明記した）。freee公式のAPIリファレンス（`https://developer.freee.co.jp/`）や実際のレスポンスと突き合わせながら使うこと。また運用者ごとの `config.yaml` のサービス名・認証設定のカスタマイズにより実際の挙動と差異が出ることがある。重要な実装の前には実際のレスポンス・実際の `config.yaml` で仕様を確認すること。
+本ドキュメントの内容は `freee-cli` リポジトリ（`internal/client/client.go`, `internal/oauth/oauth.go`, `cmd/root.go`, `cmd/auth_login.go`, `cmd/configure.go`, `cmd/accounting_*.go`, `cmd/hr_*.go`, `cmd/invoice_*.go`, `cmd/sales_*.go`）と、boid リポジトリ（`internal/config/apigateway.go`, `internal/apigateway/oauth2.go`, `internal/apigateway/login.go`, `docs/ja/reference/config-yaml.md`, `docs/plans/api-gateway.md`）の調査に基づく記載。account修飾（`@ubs`/`@nvt`、`require_account`）まわりの記述は、boidの「1 service複数credential（account修飾）」機能（`internal/apigateway/route.go`、`internal/apigateway/credentials.go`、`internal/config/schema.go`）の調査に基づく。特に `docs/ja/reference/config-yaml.md` はfreeeを `oauth_providers`/`services` の具体的な設定例として明示的に取り上げており、本スキルのゲートウェイ設定の記述はこれを一次情報としている。ただし、`freee-cli` はリクエストボディやエラーレスポンスの中身を検証・整形せずほぼそのまま右から左に受け流す設計のため（stdin JSONをそのままPOST/PUT/PATCHボディに使い、レスポンスも `json.RawMessage` のまま返す）、**リクエストボディの必須フィールドやエラーレスポンスの正確な形については、CLIのコードだけでは検証しきれていない部分がある**（該当箇所はその都度「要検証」と明記した）。freee公式のAPIリファレンス（`https://developer.freee.co.jp/`）や実際のレスポンスと突き合わせながら使うこと。また運用者ごとの `config.yaml` のサービス名・認証設定のカスタマイズにより実際の挙動と差異が出ることがある。重要な実装の前には実際のレスポンス・実際の `config.yaml` で仕様を確認すること。

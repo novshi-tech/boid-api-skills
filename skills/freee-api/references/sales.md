@@ -50,11 +50,11 @@ PATCH /sm/sales/{id}          # 更新（PATCH）
 curl --cacert "$BOID_API_CA_FILE" -G \
   --data-urlencode "company_id=123456" \
   --data-urlencode "limit=50" \
-  "$BOID_API_BASE/freee/sm/sales"
+  "$BOID_API_BASE/freee@ubs/sm/sales"
 
 echo '{"status": "confirmed"}' | curl --cacert "$BOID_API_CA_FILE" -X PATCH \
   -H "Content-Type: application/json" --data-binary @- \
-  "$BOID_API_BASE/freee/sm/sales/{id}"
+  "$BOID_API_BASE/freee@ubs/sm/sales/{id}"
 ```
 
 ## マスタデータ（master、いずれも読み取り専用）
