@@ -27,6 +27,25 @@ filter that still means something: a person wrote to you and you have not
 dealt with it. Anything wider turns the card queue into a second inbox,
 which makes the whole system worthless.
 
+## 自動送信を機構で落とす
+
+"To に自分" が通っても、**自動送信のメールはそのほとんどが To に直接入ってくる** ——
+実測 (2026-08-29、Outlook 受信箱 2 日ぶん) では To+未読 22 件のうち no-reply 系が 10 件、
+残りも通知・配信物が大半だった。これを判断側 (LLM) に渡すと、1 日 10 件以上の subagent が
+ニュースレターを skip する判断に費やされ、その間 card queue にも出る —— 判断の入口が
+2 つめの inbox になり、この仕組み全体が無価値になる。
+
+だから**機構で落とす**。落とし方は 2 段:
+
+- **`no-reply` 系の送信者は既定で落ちる** (`DEFAULT_EXCLUDE_LOCALPARTS`)。
+  「返信しないでください」と名乗っているアドレスは、定義上「あなたに返事を期待して
+  書いた人」ではない —— この connector の前提そのものに反する
+- **`exclude_domains` / `exclude_senders`** を workspace が育てる。ノイズの質は
+  workspace ごとに違うので、ここは宣言側の責務 (設計 §8.4)
+
+**除外した件数は毎巡 stderr に出す。** 篩いが効きすぎて必要なメールまで落としている
+場合、それは「来ない signal」としてしか現れず外から気づけない。
+
 ## Identity is the CONVERSATION, not the message
 
 A reply to a mail you already have a card for is the same piece of work, so
@@ -71,6 +90,41 @@ DEFAULT_INITIAL_WINDOW_DAYS = 7
 INGEST_CHUNK_SIZE = 200
 
 DEFAULT_FOLDER = "inbox"
+
+#: 既定で落とす送信者ローカルパート。**完全一致ではなく含有**で見る ——
+#: `no-reply` / `noreply` / `cmp-noreply` / `no_reply` はどれも同じことを名乗っている。
+DEFAULT_EXCLUDE_LOCALPARTS = ("noreply", "no-reply", "no_reply", "donotreply", "do-not-reply")
+
+
+def _address_of(raw: str) -> str:
+    """`"名前" <a@b.example>` から `a@b.example` を取り出す。素のアドレスは素通し。"""
+    if not raw:
+        return ""
+    text = raw.strip()
+    if "<" in text and ">" in text:
+        text = text[text.rfind("<") + 1 : text.rfind(">")]
+    return text.strip().strip("\"'").lower()
+
+
+def is_excluded(sender: str, *, senders: "Sequence[str]" = (), domains: "Sequence[str]" = ()) -> bool:
+    """この送信者を機構で落とすか。
+
+    3 つの判定を OR で取る: 明示された送信者、明示されたドメイン (サブドメインも含む)、
+    そして `no-reply` 系のローカルパート。**判定できないとき (アドレスが読めない) は
+    落とさない** —— 迷ったら通す側に倒す。取りこぼしは次の巡で拾えるが、誤って落とした
+    メールは二度と出てこない。
+    """
+    address = _address_of(sender)
+    if not address or "@" not in address:
+        return False
+    local, _, domain = address.partition("@")
+    if address in {s.strip().lower() for s in senders if s}:
+        return True
+    for excluded in domains:
+        excluded = excluded.strip().lower().lstrip(".")
+        if excluded and (domain == excluded or domain.endswith("." + excluded)):
+            return True
+    return any(marker in local for marker in DEFAULT_EXCLUDE_LOCALPARTS)
 
 #: Asked for by name so the response carries the envelope fields and **not
 #: the body** — a Signal says something happened, it does not carry content.
@@ -240,6 +294,8 @@ def collect_envelopes(
     folder: str = DEFAULT_FOLDER,
     top: int = DEFAULT_TOP,
     initial_window_days: float = DEFAULT_INITIAL_WINDOW_DAYS,
+    exclude_senders: "Sequence[str]" = (),
+    exclude_domains: "Sequence[str]" = (),
     get: Any = gateway_get,
 ) -> list[dict]:
     """Fetch, filter, and shape one run's Signal rows (envelope v0).
@@ -259,7 +315,7 @@ def collect_envelopes(
     messages = _list_messages(service, folder=folder, since=_to_rfc3339(floor), top=top, get=get)
 
     rows: list[dict] = []
-    skipped_not_to_me = skipped_unreadable = skipped_before_cursor = 0
+    skipped_not_to_me = skipped_unreadable = skipped_before_cursor = skipped_excluded = 0
     for message in messages:
         conversation = message.get("conversationId")
         message_id = message.get("id")
@@ -273,6 +329,13 @@ def collect_envelopes(
         if not addressed_to(message, me):
             skipped_not_to_me += 1
             continue
+        sender = message.get("from")
+        address = ((sender or {}).get("emailAddress") or {}) if isinstance(sender, Mapping) else {}
+        sender_address = address.get("address") if isinstance(address, Mapping) else None
+        sender_address = sender_address if isinstance(sender_address, str) else ""
+        if is_excluded(sender_address, senders=exclude_senders, domains=exclude_domains):
+            skipped_excluded += 1
+            continue
         occurred_at = _to_rfc3339(at)
         row = {
             "id": message_id,
@@ -282,28 +345,27 @@ def collect_envelopes(
         link = message.get("webLink")
         if isinstance(link, str) and link:
             row["url"] = link
-        sender = message.get("from")
-        address = ((sender or {}).get("emailAddress") or {}) if isinstance(sender, Mapping) else {}
-        value = address.get("address") if isinstance(address, Mapping) else None
-        if isinstance(value, str) and value:
+        if sender_address:
             # The self-authored screen reads this: mail you sent yourself
             # that somehow shows unread is not worth a card.
-            row["author"] = value
+            row["author"] = sender_address
         subject = message.get("subject")
         if isinstance(subject, str) and subject:
             row["title"] = subject
         rows.append(row)
 
     rows.sort(key=lambda r: (r["occurred_at"], r["id"]))
-    if skipped_not_to_me or skipped_unreadable or skipped_before_cursor:
-        # Not a failure — cc'd mail is routine, and that count is the one
-        # number that says whether this filter is doing anything. Reported so
-        # a systemic cause is visible somewhere instead of showing up only as
-        # "exits 0, nothing ever arrives".
+    total_dropped = skipped_not_to_me + skipped_unreadable + skipped_before_cursor + skipped_excluded
+    if total_dropped:
+        # Not a failure — cc'd mail and newsletters are routine, and these two
+        # counts are the ones that say whether each filter is doing its job,
+        # and whether either is doing too much. Reported so a systemic cause is
+        # visible somewhere instead of showing up only as "exits 0, nothing
+        # ever arrives".
         print(
-            f"unread-to-me: dropped {skipped_not_to_me + skipped_unreadable + skipped_before_cursor} message(s) "
-            f"(not_to_me={skipped_not_to_me} unreadable={skipped_unreadable} "
-            f"before_cursor={skipped_before_cursor})",
+            f"unread-to-me: dropped {total_dropped} message(s) "
+            f"(not_to_me={skipped_not_to_me} excluded_sender={skipped_excluded} "
+            f"unreadable={skipped_unreadable} before_cursor={skipped_before_cursor})",
             file=sys.stderr,
         )
     return rows
@@ -323,6 +385,26 @@ def ingest_signals(rows: Sequence[Mapping[str, Any]], *, run: Any = subprocess.r
         proc = run(["boid", "signal", "ingest"], input=payload, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             raise RuntimeError(f"boid signal ingest: {proc.stderr.strip()}")
+
+
+def _string_list(value: Any) -> "list[str]":
+    """A config list, written as a COMMA-SEPARATED string.
+
+    A YAML array would read better, but a Pack's configSchema v0 accepts only
+    string/number/boolean and rejects the manifest outright otherwise —
+    widening that is a core change with a much bigger blast radius than this
+    one connector's convenience. A real list is still tolerated in case that
+    day comes.
+
+    Anything else is empty rather than an error: a malformed exclusion must
+    not take the run down, and "nothing extra is excluded" is the safe
+    direction — a typo then costs noise, never lost mail.
+    """
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if isinstance(v, str) and v.strip()]
+    return []
 
 
 def main() -> int:
@@ -347,6 +429,8 @@ def main() -> int:
             folder=str(config.get("folder") or DEFAULT_FOLDER),
             top=int(config.get("top") or DEFAULT_TOP),
             initial_window_days=float(config.get("initial_window_days") or DEFAULT_INITIAL_WINDOW_DAYS),
+            exclude_senders=_string_list(config.get("exclude_senders")),
+            exclude_domains=_string_list(config.get("exclude_domains")),
             get=gateway_get,
         )
         if rows:

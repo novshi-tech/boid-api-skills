@@ -37,6 +37,21 @@ connectors:
         # How far back the very first, cursor-less run looks.
         initial_window_days:
           type: number
+        # Senders whose mail never becomes a Signal, grown per workspace.
+        # `no-reply`-style local parts are already excluded by default (an
+        # address that says "do not reply" is by definition not a person
+        # writing to you, which is the connector's whole premise); these two
+        # are for the rest — notification and marketing senders that use an
+        # ordinary-looking address. Measured on a real inbox, they are the
+        # majority of what survives the To filter, and every one of them would
+        # otherwise cost a judgment round.
+        # **カンマ区切りの文字列**。Pack の configSchema v0 は string/number/boolean
+        # しか受けない (array を書くと manifest のロードで落ちる) ので、リストは
+        # この形で渡す —— core に型を足すのはこの connector 1 本の都合より広い話。
+        exclude_senders:
+          type: string
+        exclude_domains:
+          type: string
 
 skills:
   - name: microsoft-graph-api

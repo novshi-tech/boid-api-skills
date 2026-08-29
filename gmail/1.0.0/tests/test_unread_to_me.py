@@ -30,6 +30,10 @@ def _load_connector():
 
 connector = _load_connector()
 
+
+def EXCLUDED(sender, *, senders=(), domains=()):
+    return connector.is_excluded(sender, senders=senders, domains=domains)
+
 NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
 
 
@@ -193,6 +197,77 @@ class MainTest(unittest.TestCase):
         with mock.patch.dict(connector.os.environ, env, clear=True), mock.patch.object(connector.sys, "stderr", io.StringIO()):
             self.assertEqual(connector.main(), 1)
 
+
+class SenderExclusionTest(unittest.TestCase):
+    """**自動送信を機構で落とす。** 実測 (2026-08-29、受信箱 2 日ぶん) では To+未読
+    22 件のうち 10 件が no-reply 系だった。これを判断側へ渡すと 1 日 10 件以上の
+    subagent がニュースレターを skip する判断に費やされ、その間 card queue にも出る
+    —— 判断の入口が 2 つめの inbox になる。"""
+
+    def test_a_no_reply_sender_is_excluded_by_default(self):
+        """「返信しないでください」と名乗っているアドレスは、定義上「あなたに返事を
+        期待して書いた人」ではない —— この connector の前提そのものに反する。"""
+        for addr in ("no-reply@the-board.jp", "noreply@freee.co.jp",
+                     "cmp-noreply@otsuka-shokai.co.jp", "do-not-reply@example.com"):
+            with self.subTest(sender=addr):
+                self.assertTrue(EXCLUDED(addr))
+
+    def test_an_ordinary_sender_is_kept(self):
+        for addr in ("nose@urban-b.com", "reply-guy@example.com", "info@example.com"):
+            with self.subTest(sender=addr):
+                self.assertFalse(EXCLUDED(addr))
+
+    def test_a_display_name_wrapper_is_unwrapped(self):
+        self.assertTrue(EXCLUDED('"freee" <noreply@freee.co.jp>'))
+        self.assertFalse(EXCLUDED('"Nose" <nose@urban-b.com>'))
+
+    def test_an_explicit_domain_covers_its_subdomains(self):
+        self.assertTrue(EXCLUDED("info@e.atlassian.com", domains=["atlassian.com"]))
+        self.assertTrue(EXCLUDED("info@atlassian.com", domains=["atlassian.com"]))
+        self.assertFalse(EXCLUDED("info@notatlassian.com", domains=["atlassian.com"]))
+
+    def test_an_explicit_sender_is_matched_exactly_and_case_insensitively(self):
+        self.assertTrue(EXCLUDED("All@Urban-B.com", senders=["all@urban-b.com"]))
+        self.assertFalse(EXCLUDED("nose@urban-b.com", senders=["all@urban-b.com"]))
+
+    def test_an_unreadable_sender_is_kept(self):
+        """**迷ったら通す。** 取りこぼしは次の巡で拾えるが、誤って落としたメールは
+        二度と出てこない。"""
+        for raw in ("", "not an address", "<>"):
+            with self.subTest(sender=raw):
+                self.assertFalse(EXCLUDED(raw))
+
+class GmailExclusionWiringTest(unittest.TestCase):
+    def test_an_excluded_sender_never_becomes_a_row(self):
+        get = FakeGet({"messages": [{"id": "m1"}, {"id": "m2"}]},
+                      messages=[_message("m1", sender="noreply@freee.co.jp"),
+                                _message("m2", sender="nose@urban-b.com", thread="t2")])
+        err = io.StringIO()
+        with mock.patch.object(connector.sys, "stderr", err):
+            rows = connector.collect_envelopes(service="gmail-api", cursor_at=None, now=NOW, get=get)
+        self.assertEqual([r["author"] for r in rows], ["nose@urban-b.com"])
+        self.assertIn("excluded_sender=1", err.getvalue())
+
+    def test_config_lists_reach_the_filter(self):
+        get = FakeGet({"messages": [{"id": "m1"}]},
+                      messages=[_message("m1", sender="info@e.atlassian.com")])
+        with mock.patch.object(connector.sys, "stderr", io.StringIO()):
+            rows = connector.collect_envelopes(service="gmail-api", cursor_at=None, now=NOW,
+                                               exclude_domains=["atlassian.com"], get=get)
+        self.assertEqual(rows, [])
+
+    def test_a_malformed_exclusion_config_fails_open(self):
+        """typo はノイズを増やすだけで済ませる —— 落とし過ぎより取りこぼしの方が安い、
+        の逆方向 (ここは「落とさない」が安全側)。"""
+        self.assertEqual(connector._string_list(None), [])
+        self.assertEqual(connector._string_list(123), [])
+        self.assertEqual(connector._string_list(["a@b.example", 3]), ["a@b.example"])
+
+    def test_a_list_is_written_as_a_comma_separated_string(self):
+        """Pack の configSchema v0 は array を受けないので、リストはこの形で来る。"""
+        self.assertEqual(connector._string_list("a.example, b.example"), ["a.example", "b.example"])
+        self.assertEqual(connector._string_list("a.example"), ["a.example"])
+        self.assertEqual(connector._string_list(" , "), [])
 
 if __name__ == "__main__":
     unittest.main()
