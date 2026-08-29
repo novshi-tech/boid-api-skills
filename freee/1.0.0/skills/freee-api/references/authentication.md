@@ -48,7 +48,7 @@ services:
 - `manual` フローの実際の挙動（`internal/apigateway/login.go`）: 認可URLに `state`/`code_challenge` を含めず（`buildAuthorizeURL(cfg, "urn:ietf:wg:oauth:2.0:oob", "", "")`）、コード交換時（`grant_type=authorization_code`）にも `redirect_uri`/`code_verifier` を含めない（この2つは `loopback` フロー専用）
 - `scopes: [read, write]` は `config-yaml.md` のサンプル設定に登場する値であり、freee APIのスコープ体系が一般に `read`/`write` 程度の粗い区分だと確認できたわけではない（**要検証**）。ゲートウェイ経由（`manual` フロー）ではこの `oauth_providers.freee.scopes` が認可リクエストに使われる一方、`freee-cli` 自体は認可リクエストに `scope` パラメータを一切含めておらず、実効的な権限は完全にfreee側のアプリ登録設定に依存する。**同じfreee連携でも、ゲートウェイ経由の実効スコープとCLI直接実行の実効スコープが異なりうる**点に注意（詳細は後述）
 - `client_secret_key` が設定されている＝confidential client（クライアントシークレットを持つ）という前提。freeeのOAuthアプリ登録は通常クライアントシークレットの発行を伴うため、`client_secret_key` を設定するのが基本形になる
-- 実際のリフレッシュトークン・アクセストークンの値は `oauth_providers.*` にもここには書かない。`boid secret oauth login freee`（`manual` フロー時は「表示された authorize URL をブラウザで開いて同意すると、画面に code が直接表示されるので、それを CLI のプロンプトに貼り付けます」という手順になる）または `boid secret set` で別途secret storeに投入する
+- 実際のリフレッシュトークン・アクセストークンの値は `oauth_providers.*` にもここには書かない。初回認証フローの実行（`manual` フロー時は「表示された authorize URL をブラウザで開いて同意すると、画面に code が直接表示されるので、それを運用者側のプロンプトに貼り付ける」という手順になる）か、値の直接投入かのどちらかで、別途secret storeに入れる
 - 1つの `oauth_providers` エントリは複数serviceから共有できる。会計・人事労務・請求書・販売の4ドメインは単一ホスト（`https://api.freee.co.jp`）を共有するため、通常は `services.freee` 1つで4ドメインすべてをカバーできる（ドメインごとに `services` エントリを分ける必要は基本的にない）
 - 資格情報の解決・注入に失敗した場合、ゲートウェイは認証情報なしで転送せず502を返す（fail-closed）。`provider` が指す `oauth_providers` エントリ自体が存在しない場合も、config load時点ではクロスチェックされず、リクエスト時に502（`apigateway: oauth2 provider "..." is not configured`）になる
 - ゲートウェイは他にも400（account修飾の欠落・不正）、401（job token自体が無効・期限切れ）、403（サービスが未有効化 or read-only jobでの書き込み試行）、404（パス不正）、503（シークレットストア未接続）を返しうる。ステータスごとの切り分けは [pagination-and-errors.md](pagination-and-errors.md) の一覧を参照
@@ -67,14 +67,7 @@ secret storeのキーはaccountで修飾される:
 
 **`oauth_providers.freee.client_secret_key` はaccountで修飾されない。** `client_secret` はOAuthアプリ（provider）単位の値で、`ubs`/`nvt` どちらのアカウントでログインしても同じ `client_secret` を使う（1つのOAuthアプリに、別々のfreeeユーザーが個別に認可を与える形）。
 
-初回のログイン（認可コードの取得）はアカウントごとに1回ずつ必要:
-
-```bash
-boid secret oauth login freee --account ubs
-boid secret oauth login freee --account nvt
-```
-
-`--account` を省略すると無修飾のキー（`oauth2:freee:refresh_token` 等）に書き込まれるが、`freee` は `require_account: true` のためそのcredentialを使うリクエスト経路が存在しない。freeeに対してログインする場合は必ず `--account` を指定すること。
+初回のログイン（認可コードの取得）はアカウントごとに1回ずつ必要—— `ubs`/`nvt` それぞれについて、どちらのaccount向けかを明示した状態で認証フローを実行する。account指定を省略すると無修飾のキー（`oauth2:freee:refresh_token` 等）に書き込まれるが、`freee` は `require_account: true` のためそのcredentialを使うリクエスト経路が存在しない。freeeに対してログインする場合は必ずaccountを指定すること（具体的なログイン手順はboid運用者向けの操作であり本スキルのスコープ外 —— 本スキルはfreee API自体の仕様を扱う）。
 
 存在しないaccountを指定してリクエストした場合（例: `freee@typo`）、実在する他のaccountのcredentialへは**フォールバックしない**。502で失敗する（fail-closed）。account修飾を書き忘れた場合の400との違いは [pagination-and-errors.md](pagination-and-errors.md) を参照。
 
